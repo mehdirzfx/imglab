@@ -6,6 +6,7 @@ Image Lab  -  Edge detection / Perspective correction / Restoration
 
 GUI:   python image_lab.py [image]
 CLI:   python image_lab.py in.jpg -o out.png -p "perspective:quad=auto,plate=1;unsharp:amount=1.5"
+Batch: python image_lab.py in_folder -o out_folder --preset my.json [--auto-persp]
 List:  python image_lab.py --list
 
 Requirements:  pip install opencv-python numpy      (tkinter ships with Python)
@@ -16,9 +17,11 @@ Perspective quad:       quad=auto   or   quad=x1|y1|x2|y2|x3|y3|x4|y4
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
 import queue
+import re
 import sys
 import threading
 import time
@@ -474,9 +477,13 @@ def _psf(kind, size, angle):
     P("size", "Blur size / length", "float", 5.0, 1.0, 40.0, 0.5),
     P("angle", "Motion angle", "float", 0.0, -90.0, 90.0, 1.0),
     P("noise", "Noise (higher = safer)", "float", 0.01, 0.0005, 0.3, 0.0005),
+    P("method", "Method", "choice", "wiener", choices=("wiener", "richardson_lucy")),
+    P("iters", "Iterations (Richardson-Lucy)", "int", 15, 1, 60, 1),
 ])
-def deblur(img, kind, size, angle, noise):
+def deblur(img, kind, size, angle, noise, method="wiener", iters=15):
     k = _psf(kind, size, angle)
+    if method == "richardson_lucy":
+        return richardson_lucy(img, k, iters)
     kh, kw = k.shape
     pad = max(kh, kw)
     f = cv2.copyMakeBorder(img, pad, pad, pad, pad, cv2.BORDER_REFLECT)
@@ -490,6 +497,58 @@ def deblur(img, kind, size, angle, noise):
     for c in range(3):
         out[..., c] = np.real(np.fft.ifft2(np.fft.fft2(f[..., c].astype(np.float32)) * G))
     return np.clip(out[pad:-pad, pad:-pad], 0, 255)
+
+
+def richardson_lucy(img, psf, iters):
+    f = img.astype(np.float32) + 1e-3
+    est, flip = f.copy(), np.ascontiguousarray(psf[::-1, ::-1])
+    for _ in range(int(iters)):
+        conv = cv2.filter2D(est, -1, flip, borderType=cv2.BORDER_REFLECT)
+        est = est * cv2.filter2D(f / (conv + 1e-3), -1, psf, borderType=cv2.BORDER_REFLECT)
+    return np.clip(est, 0, 255)
+
+
+def estimate_motion_blur(img, max_len=40):
+    """Estimate (length, angle_deg, found) of linear motion blur via the cepstrum."""
+    g = to_gray(img).astype(np.float32)
+    s = min(min(g.shape), 512)
+    y0, x0 = (g.shape[0] - s) // 2, (g.shape[1] - s) // 2
+    g = g[y0:y0 + s, x0:x0 + s]
+    g = (g - g.mean()) * np.outer(np.hanning(s), np.hanning(s)).astype(np.float32)
+    spec = np.log(np.abs(np.fft.fft2(g)) + 1e-2)
+    cep = np.fft.fftshift(np.real(np.fft.ifft2(spec)))
+    c = s // 2
+    yy, xx = np.ogrid[:s, :s]
+    r2 = (yy - c) ** 2 + (xx - c) ** 2
+    mask = (r2 >= 9) & (r2 <= max_len ** 2)
+    vals = cep[mask]
+    idx = np.argmin(np.where(mask, cep, np.inf))
+    dy, dx = (int(v) - c for v in np.unravel_index(idx, cep.shape))
+    z = (vals.mean() - cep[dy + c, dx + c]) / (vals.std() + 1e-9)
+    angle = math.degrees(math.atan2(-dy, dx))
+    if angle > 90:
+        angle -= 180
+    if angle <= -90:
+        angle += 180
+    return math.hypot(dx, dy), angle, bool(z > 8.0)
+
+
+@register("auto_deblur", "Restore", "Auto deblur (estimates the blur)", "Detects motion-blur length/angle from the image itself, then deconvolves. Falls back to Gaussian if no motion found.", [
+    P("method", "Method", "choice", "wiener", choices=("wiener", "richardson_lucy")),
+    P("noise", "Noise (Wiener)", "float", 0.02, 0.0005, 0.3, 0.0005),
+    P("iters", "Iterations (Richardson-Lucy)", "int", 15, 1, 60, 1),
+    P("max_len", "Max blur length", "int", 40, 5, 100, 1),
+    P("fallback", "Gaussian size if no motion found (0 = skip)", "float", 0.0, 0.0, 6.0, 0.1),
+])
+def auto_deblur(img, method, noise, iters, max_len, fallback):
+    L, ang, ok = estimate_motion_blur(img, max_len)
+    if ok:
+        kind, size, angle = "motion", L, ang
+    elif fallback > 0:
+        kind, size, angle = "gaussian", fallback, 0.0
+    else:
+        return img
+    return deblur(img, kind, size, angle, noise, method, iters)
 
 
 @register("upscale", "Restore", "Upscale (super-resolution style)", "Enlarge with progressive cubic + edge-preserving cleanup + sharpening.", [
@@ -516,6 +575,28 @@ def upscale(img, factor, method, sharpen):
             out = _unsharp(out, 0.5, 1.0)
             cur *= step
     return _unsharp(out, sharpen, 1.2) if sharpen > 0 else out
+
+
+@register("ai_upscale", "Restore", "AI upscale (EDSR / ESPCN / FSRCNN / LapSRN)",
+          "Neural super-resolution. Needs opencv-contrib-python and a .pb model whose name contains the scale, e.g. EDSR_x4.pb. Slow on big images.", [
+    P("model", "Model file (.pb)", "str", "models/EDSR_x4.pb"),
+])
+def ai_upscale(img, model):
+    if not hasattr(cv2, "dnn_superres"):
+        raise RuntimeError("cv2.dnn_superres missing: pip uninstall opencv-python && pip install opencv-contrib-python")
+    if not os.path.isfile(model):
+        raise FileNotFoundError(f"Model file not found: {model}")
+    name = os.path.basename(model).lower()
+    m = re.search(r"x(\d)", name)
+    if not m:
+        raise ValueError("Model file name must contain the scale, e.g. EDSR_x4.pb")
+    algo = re.split(r"[_\-. ]", name)[0]
+    if algo not in ("edsr", "espcn", "fsrcnn", "lapsrn"):
+        raise ValueError("Model name must start with edsr / espcn / fsrcnn / lapsrn")
+    sr = cv2.dnn_superres.DnnSuperResImpl_create()
+    sr.readModel(model)
+    sr.setModel(algo, int(m.group(1)))
+    return sr.upsample(img)
 
 
 # ----------------------------------------------------------------------------
@@ -588,6 +669,25 @@ def flip(img, mode):
         "rot90_cw": lambda a: cv2.rotate(a, cv2.ROTATE_90_CLOCKWISE),
         "rot90_ccw": lambda a: cv2.rotate(a, cv2.ROTATE_90_COUNTERCLOCKWISE),
     }[mode](img)
+
+
+@register("deskew", "Geometry", "Auto deskew (straighten text / lines)", "Finds the dominant near-horizontal line angle with Hough and rotates it level.", [
+    P("max_angle", "Max angle to correct", "float", 15.0, 1.0, 45.0, 1.0),
+    P("expand", "Expand canvas", "bool", True),
+])
+def deskew(img, max_angle, expand):
+    g = to_gray(img)
+    e = cv2.Canny(cv2.GaussianBlur(g, (3, 3), 0), 50, 150)
+    lines = cv2.HoughLinesP(e, 1, np.pi / 720, threshold=60, minLineLength=max(20, min(g.shape) // 6), maxLineGap=10)
+    if lines is None:
+        return img
+    angs = []
+    for x1, y1, x2, y2 in lines.reshape(-1, 4):
+        a = math.degrees(math.atan2(y2 - y1, x2 - x1))
+        a = a - 180 if a > 90 else (a + 180 if a < -90 else a)
+        if abs(a) <= max_angle:
+            angs.append(a)
+    return rotate(img, float(np.median(angs)), expand) if angs else img
 
 
 # ----------------------------------------------------------------------------
@@ -707,6 +807,62 @@ def perspective(img, quad, plate, candidate, aspect, scale, interp):
     return warp_quad(img, q, aspect, scale, interp)
 
 
+@register("plate_enhance", "Plate", "Plate / sign - one click", "Auto-detect the plate, straighten it, then denoise, auto-deblur, normalise height, local contrast and sharpen.", [
+    P("detect", "Auto-detect & straighten", "bool", True),
+    P("aspect", "Aspect w/h (0 = auto)", "float", 4.0, 0.0, 8.0, 0.01),
+    P("height", "Output height (px)", "int", 220, 60, 800, 10),
+    P("denoise", "Denoise strength", "float", 4.0, 0.0, 20.0, 0.5),
+    P("fix_blur", "Auto deblur", "bool", True),
+    P("contrast", "Local contrast (CLAHE)", "bool", True),
+    P("sharpen", "Sharpen", "float", 1.0, 0.0, 3.0, 0.05),
+    P("bw", "Black/white output", "bool", False),
+])
+def plate_enhance(img, detect, aspect, height, denoise, fix_blur, contrast, sharpen, bw):
+    out = img
+    if detect:
+        qs = find_quads(img, plate=True)
+        if qs:
+            out = warp_quad(img, qs[0], aspect, 1.0, "cubic")
+    s = height / out.shape[0]
+    out = cv2.resize(out, None, fx=s, fy=s, interpolation=cv2.INTER_CUBIC if s > 1 else cv2.INTER_AREA)
+    if denoise > 0:
+        out = cv2.fastNlMeansDenoisingColored(out, None, denoise, denoise, 7, 21)
+    if fix_blur:
+        out = ensure_bgr(auto_deblur(out, "wiener", 0.02, 15, 30, 0.0))
+    if contrast:
+        out = clahe(out, 2.0, 4)
+    if sharpen > 0:
+        out = ensure_bgr(_unsharp(out, sharpen, 1.2))
+    return ensure_bgr(binarize(out, "adaptive_gaussian", 31, 10, False)) if bw else out
+
+
+# ----------------------------------------------------------------------------
+# OCR (optional)
+# ----------------------------------------------------------------------------
+
+OCR_TESS_LANG = "eng"        # e.g. "fas+eng" if the Persian traineddata is installed
+OCR_EASY_LANGS = ["en"]      # e.g. ["fa", "en"]
+
+
+def ocr_text(img):
+    g = to_gray(img)
+    tess_err = None
+    try:
+        import pytesseract
+        return pytesseract.image_to_string(g, lang=OCR_TESS_LANG, config="--psm 7").strip()
+    except ImportError:
+        pass
+    except Exception as e:  # Tesseract binary missing, bad language ...
+        tess_err = e
+    try:
+        import easyocr
+    except ImportError:
+        raise RuntimeError(str(tess_err) if tess_err else
+                           "OCR needs pytesseract (+Tesseract) or easyocr:  pip install easyocr")
+    reader = easyocr.Reader(OCR_EASY_LANGS, gpu=False, verbose=False)
+    return " ".join(reader.readtext(ensure_bgr(img), detail=0)).strip()
+
+
 # ----------------------------------------------------------------------------
 # Pipeline (CLI + recipe export)
 # ----------------------------------------------------------------------------
@@ -756,6 +912,46 @@ def recipe_string(recipe):
     def fmt(v):
         return ("1" if v else "0") if isinstance(v, bool) else (f"{v:g}" if isinstance(v, float) else str(v))
     return "; ".join(f"{n}:" + ",".join(f"{k}={fmt(v)}" for k, v in p.items()) for n, p in recipe)
+
+
+IMG_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp")
+
+
+def save_preset(path, steps):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"version": 1, "steps": [[n, p] for n, p in steps]}, f, indent=1, default=str)
+
+
+def load_preset(path):
+    with open(path, encoding="utf-8") as f:
+        d = json.load(f)
+    steps = []
+    for n, kv in d["steps"]:
+        if n not in OPS:
+            raise KeyError(f"Preset uses unknown operation '{n}'")
+        steps.append((n, dict(kv)))
+    return steps
+
+
+def batch_steps(steps, auto_persp):
+    """For batch runs a fixed perspective quad is meaningless; optionally re-detect per image."""
+    out = []
+    for n, kv in steps:
+        kv = dict(kv)
+        if n == "perspective" and auto_persp:
+            kv["plate"] = float(kv.get("aspect", 0) or 0) >= 1.8
+            kv["quad"], kv["candidate"] = "auto", 0
+        out.append((n, kv))
+    return out
+
+
+def list_images(folder):
+    return sorted(f for f in os.listdir(folder)
+                  if f.lower().endswith(IMG_EXTS) and not os.path.splitext(f)[0].endswith("_out"))
+
+
+def process_file(src, dst, steps):
+    imwrite(dst, run_pipeline(imread(src), steps))
 
 
 # ----------------------------------------------------------------------------
@@ -813,9 +1009,19 @@ class OpPanel(ttk.Frame):
                 c = ttk.Combobox(self.box, textvariable=var, values=p.choices, state="readonly")
                 c.pack(fill="x", pady=(0, 4))
                 c.bind("<<ComboboxSelected>>", lambda e: self.changed())
+            elif p.kind == "str":
+                var = tk.StringVar(value=p.default)
+                ttk.Label(self.box, text=p.label).pack(anchor="w")
+                row = ttk.Frame(self.box)
+                row.pack(fill="x", pady=(0, 4))
+                ttk.Entry(row, textvariable=var).pack(side="left", fill="x", expand=True)
+                if p.key == "model":
+                    ttk.Button(row, text="...", width=3,
+                               command=lambda v=var: v.set(filedialog.askopenfilename() or v.get())).pack(side="left", padx=2)
             else:
                 continue
-            var.trace_add("write", lambda *a: self.changed())
+            if p.kind != "str":
+                var.trace_add("write", lambda *a: self.changed())
             self.vars[p.key] = var
 
     def values(self):
@@ -890,6 +1096,97 @@ class PerspectivePanel(ttk.Frame):
                 ("perspective", {"quad": qs, "aspect": a, "scale": s, "interp": it}))
 
 
+class PipelinePanel(ttk.Frame):
+    """Shows applied steps; reorder/remove, rebuild from the original, presets, batch folder."""
+
+    def __init__(self, master, app):
+        super().__init__(master)
+        self.app = app
+        ttk.Label(self, text="Applied steps. Reorder / remove, then 'Rebuild from original'.\n"
+                             "Presets and batch use these steps.",
+                  wraplength=340, justify="left", foreground="#777").pack(fill="x", padx=8, pady=8)
+        self.lb = tk.Listbox(self, height=14, exportselection=False)
+        self.lb.pack(fill="both", expand=True, padx=8)
+        r1 = ttk.Frame(self)
+        r1.pack(fill="x", padx=6, pady=4)
+        for t, c in (("Up", self.up), ("Down", self.down), ("Remove", self.remove)):
+            ttk.Button(r1, text=t, command=c).pack(side="left", padx=2)
+        ttk.Button(self, text="Rebuild from original", command=app.rebuild).pack(fill="x", padx=8, pady=2)
+        r2 = ttk.Frame(self)
+        r2.pack(fill="x", padx=6, pady=4)
+        ttk.Button(r2, text="Save preset...", command=self.save).pack(side="left", padx=2)
+        ttk.Button(r2, text="Load preset...", command=self.load).pack(side="left", padx=2)
+        ttk.Separator(self).pack(fill="x", padx=8, pady=8)
+        self.auto_persp = tk.BooleanVar(value=True)
+        ttk.Checkbutton(self, text="Batch: re-detect perspective per image",
+                        variable=self.auto_persp).pack(anchor="w", padx=8)
+        ttk.Button(self, text="Batch process folder...", command=self.batch).pack(fill="x", padx=8, pady=6)
+        self.refresh()
+
+    def refresh(self):
+        self.lb.delete(0, "end")
+        for i, (n, p) in enumerate(self.app.recipe, 1):
+            txt = ", ".join(f"{k}={v:g}" if isinstance(v, float) else f"{k}={v}"
+                            for k, v in p.items() if k != "quad")
+            self.lb.insert("end", f"{i}. {n}  ({txt[:55]})")
+
+    def _sel(self):
+        s = self.lb.curselection()
+        return s[0] if s else None
+
+    def _move(self, i, j):
+        r = self.app.recipe
+        r[i], r[j] = r[j], r[i]
+        self.refresh()
+        self.lb.selection_set(j)
+
+    def up(self):
+        i = self._sel()
+        if i:
+            self._move(i, i - 1)
+
+    def down(self):
+        i = self._sel()
+        if i is not None and i < len(self.app.recipe) - 1:
+            self._move(i, i + 1)
+
+    def remove(self):
+        i = self._sel()
+        if i is not None:
+            del self.app.recipe[i]
+            self.refresh()
+
+    def save(self):
+        p = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("Preset", "*.json")])
+        if p:
+            save_preset(p, self.app.recipe)
+            self.app.msg.set(f"Preset saved: {p}")
+
+    def load(self):
+        p = filedialog.askopenfilename(filetypes=[("Preset", "*.json")])
+        if not p:
+            return
+        try:
+            steps = load_preset(p)
+        except Exception as e:
+            messagebox.showerror("Preset", str(e))
+            return
+        self.app.recipe = steps
+        self.refresh()
+        self.app.rebuild()
+
+    def batch(self):
+        if not self.app.recipe:
+            messagebox.showinfo("Batch", "Apply at least one step first (or load a preset).")
+            return
+        src = filedialog.askdirectory(title="Input folder")
+        if not src:
+            return
+        dst = filedialog.askdirectory(title="Output folder")
+        if dst:
+            self.app.start_batch(src, dst, self.auto_persp.get())
+
+
 class App(tk.Tk):
     def __init__(self, path=None):
         super().__init__()
@@ -900,13 +1197,17 @@ class App(tk.Tk):
         self.zoom, self.off = 1.0, [0.0, 0.0]
         self.pts, self.cands, self.cand_i = [], [], 0
         self.compare = False
-        self.q = queue.Queue()
+        self.split_on = tk.BooleanVar(value=False)
+        self.split_pos = 0.5
+        self._drag_split = False
+        self.q, self.aux_q = queue.Queue(), queue.Queue()
         self.req = 0
         self.committing = False
-        self._cache = (None, None, None)
+        self._cache, self._orig_r = {}, None
         self._photo = None
         self._drag_idx = None
         self._pan = None
+        self._batch = None
         self._build()
         self.after(40, self._poll)
         if path:
@@ -918,10 +1219,12 @@ class App(tk.Tk):
         top.pack(fill="x")
         for text, cmd in [("Open", self.open), ("Save", self.save), ("Undo", self.undo), ("Redo", self.redo),
                           ("Reset", self.reset), ("Fit", self.fit), ("1:1", self.one_to_one),
-                          ("Copy CLI recipe", self.copy_recipe)]:
+                          ("OCR", self.do_ocr), ("Copy CLI recipe", self.copy_recipe)]:
             ttk.Button(top, text=text, command=cmd).pack(side="left", padx=2, pady=4)
+        ttk.Checkbutton(top, text="Split view (original | edited)", variable=self.split_on,
+                        command=self.render).pack(side="left", padx=10)
         b = ttk.Button(top, text="Hold: show original")
-        b.pack(side="left", padx=8)
+        b.pack(side="left", padx=4)
         b.bind("<ButtonPress-1>", lambda e: self.set_compare(True))
         b.bind("<ButtonRelease-1>", lambda e: self.set_compare(False))
 
@@ -931,16 +1234,17 @@ class App(tk.Tk):
         pw.add(self.canvas, weight=1)
         nb = ttk.Notebook(pw, width=390)
         pw.add(nb)
-        cats = ["Edges", "Restore", "Enhance", "Threshold & Morph", "Geometry"]
         self.panels = {}
-        for cat in cats:
-            ops = [o for o in OPS.values() if o.category == cat]
-            self.panels[cat] = OpPanel(nb, self, ops)
-        nb.add(self.panels["Edges"], text="Edges")
+        for cat in ("Edges", "Plate", "Restore", "Enhance", "Threshold & Morph", "Geometry"):
+            self.panels[cat] = OpPanel(nb, self, [o for o in OPS.values() if o.category == cat])
         self.persp = PerspectivePanel(nb, self)
+        self.pipeline = PipelinePanel(nb, self)
+        nb.add(self.panels["Edges"], text="Edges")
         nb.add(self.persp, text="Perspective")
-        for cat in cats[1:]:
+        nb.add(self.panels["Plate"], text="Plate")
+        for cat in ("Restore", "Enhance", "Threshold & Morph", "Geometry"):
             nb.add(self.panels[cat], text=cat)
+        nb.add(self.pipeline, text="Pipeline")
 
         st = ttk.Frame(self)
         st.pack(fill="x")
@@ -953,7 +1257,7 @@ class App(tk.Tk):
         c.bind("<Configure>", lambda e: self.render())
         c.bind("<ButtonPress-1>", self._press)
         c.bind("<B1-Motion>", self._drag)
-        c.bind("<ButtonRelease-1>", lambda e: setattr(self, "_drag_idx", None))
+        c.bind("<ButtonRelease-1>", self._release)
         for n in (2, 3):
             c.bind(f"<ButtonPress-{n}>", self._pan_start)
             c.bind(f"<B{n}-Motion>", self._pan_move)
@@ -981,6 +1285,9 @@ class App(tk.Tk):
         self.original, self.current, self.preview = img, img.copy(), None
         self.history, self.redo_stack, self.recipe = [], [], []
         self.pts, self.cands = [], []
+        self._cache.clear()
+        self._orig_r = None
+        self.pipeline.refresh()
         self.title(f"Image Lab - {os.path.basename(path)}")
         self.update_idletasks()
         self.fit()
@@ -1002,8 +1309,50 @@ class App(tk.Tk):
         self.clipboard_append(s)
         self.msg.set("CLI pipeline copied: " + (s[:90] + "..." if len(s) > 90 else s))
 
+    # ---- OCR / batch (background work, results via aux_q) -----------------
+    def do_ocr(self):
+        img = self.preview if self.preview is not None else self.current
+        if img is None:
+            return
+        self.msg.set("Running OCR ...")
+
+        def work():
+            try:
+                self.aux_q.put(("ocr", ocr_text(img), None))
+            except Exception as e:  # noqa
+                self.aux_q.put(("ocr", None, str(e)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def start_batch(self, indir, outdir, auto_persp):
+        files = list_images(indir)
+        if not files:
+            messagebox.showinfo("Batch", "No images found in that folder.")
+            return
+        os.makedirs(outdir, exist_ok=True)
+        steps = batch_steps(list(self.recipe), auto_persp)
+        win = tk.Toplevel(self)
+        win.title("Batch processing")
+        pb = ttk.Progressbar(win, length=380, maximum=len(files))
+        pb.pack(padx=14, pady=(14, 6))
+        lbl = ttk.Label(win, text="")
+        lbl.pack(padx=14, pady=(0, 14))
+        self._batch = (win, pb, lbl)
+
+        def work():
+            ok = fail = 0
+            for i, f in enumerate(files, 1):
+                err = None
+                try:
+                    process_file(os.path.join(indir, f), os.path.join(outdir, os.path.splitext(f)[0] + "_out.png"), steps)
+                    ok += 1
+                except Exception as e:  # noqa
+                    err, fail = str(e), fail + 1
+                self.aux_q.put(("batch", i, len(files), f, err))
+            self.aux_q.put(("batch_done", ok, fail))
+        threading.Thread(target=work, daemon=True).start()
+
     # ---- processing ------------------------------------------------------
-    def run(self, fn, commit, label, recipe=None):
+    def run(self, fn, commit, label, recipe=None, replace_recipe=None):
         if self.current is None:
             return
         if commit:
@@ -1017,15 +1366,21 @@ class App(tk.Tk):
         def work():
             t = time.time()
             try:
-                self.q.put((rid, commit, label, recipe, ensure_bgr(fn()), None, time.time() - t))
+                self.q.put((rid, commit, label, recipe, ensure_bgr(fn()), None, time.time() - t, replace_recipe))
             except Exception as e:  # noqa
-                self.q.put((rid, commit, label, recipe, None, e, 0))
+                self.q.put((rid, commit, label, recipe, None, e, 0, replace_recipe))
         threading.Thread(target=work, daemon=True).start()
+
+    def rebuild(self):
+        if self.original is None:
+            return
+        steps = list(self.recipe)
+        self.run(lambda: run_pipeline(self.original, steps), True, "Rebuild pipeline", None, steps)
 
     def _poll(self):
         try:
             while True:
-                rid, commit, label, recipe, res, err, dt = self.q.get_nowait()
+                rid, commit, label, recipe, res, err, dt, replace = self.q.get_nowait()
                 if commit:
                     self.committing = False
                 if err is not None:
@@ -1041,8 +1396,11 @@ class App(tk.Tk):
                         self.current = res
                         self.fit()
                     self.current, self.preview = res, None
-                    if recipe:
+                    if replace is not None:
+                        self.recipe = list(replace)
+                    elif recipe:
                         self.recipe.append(recipe)
+                    self.pipeline.refresh()
                     self.msg.set(f"Applied {label} ({dt:.2f}s) -> {res.shape[1]}x{res.shape[0]}")
                     self.render()
                 elif rid == self.req:
@@ -1051,14 +1409,39 @@ class App(tk.Tk):
                     self.render()
         except queue.Empty:
             pass
+        try:
+            while True:
+                item = self.aux_q.get_nowait()
+                if item[0] == "ocr":
+                    _, text, err = item
+                    if err:
+                        self.msg.set("OCR failed")
+                        messagebox.showerror("OCR", err)
+                    else:
+                        self.clipboard_clear()
+                        self.clipboard_append(text)
+                        self.msg.set(f"OCR: {text}  (copied)")
+                        messagebox.showinfo("OCR result", text or "(nothing recognised)")
+                elif item[0] == "batch" and self._batch:
+                    _, i, n, f, err = item
+                    self._batch[1]["value"] = i
+                    self._batch[2].config(text=f"{i}/{n}  {f}" + (f"   ERROR: {err}" if err else ""))
+                elif item[0] == "batch_done":
+                    _, ok, fail = item
+                    if self._batch:
+                        self._batch[0].destroy()
+                        self._batch = None
+                    messagebox.showinfo("Batch", f"Done: {ok} ok, {fail} failed.")
+        except queue.Empty:
+            pass
         self.after(40, self._poll)
 
     def undo(self):
         if self.history:
             self.redo_stack.append((self.current, list(self.recipe)))
             self.current, self.recipe = self.history.pop()
-            self.preview = None
-            self.pts = []
+            self.preview, self.pts = None, []
+            self.pipeline.refresh()
             self.render()
 
     def redo(self):
@@ -1066,6 +1449,7 @@ class App(tk.Tk):
             self.history.append((self.current, list(self.recipe)))
             self.current, self.recipe = self.redo_stack.pop()
             self.preview = None
+            self.pipeline.refresh()
             self.render()
 
     def reset(self):
@@ -1073,6 +1457,7 @@ class App(tk.Tk):
             self.history.append((self.current, list(self.recipe)))
             self.current, self.recipe, self.preview = self.original.copy(), [], None
             self.pts = []
+            self.pipeline.refresh()
             self.fit()
 
     def set_compare(self, v):
@@ -1141,25 +1526,50 @@ class App(tk.Tk):
     def _to_cv(self, p):
         return p[0] * self.zoom + self.off[0], p[1] * self.zoom + self.off[1]
 
+    def _canvas_img(self, img, cw, ch):
+        """Draw `img` (zoomed/panned) onto a cw x ch BGR array."""
+        z = self.zoom
+        if z < 1:
+            ent = self._cache.get(id(img))
+            if ent is None or ent[0] is not img or ent[1] != z:
+                if len(self._cache) > 6:
+                    self._cache.clear()
+                ent = (img, z, cv2.resize(img, None, fx=z, fy=z, interpolation=cv2.INTER_AREA))
+                self._cache[id(img)] = ent
+            src, M, fl = ent[2], np.float32([[1, 0, self.off[0]], [0, 1, self.off[1]]]), cv2.INTER_LINEAR
+        else:
+            src, M = img, np.float32([[z, 0, self.off[0]], [0, z, self.off[1]]])
+            fl = cv2.INTER_NEAREST if z >= 4 else cv2.INTER_LINEAR
+        return cv2.warpAffine(src, M, (cw, ch), flags=fl, borderMode=cv2.BORDER_CONSTANT, borderValue=(40, 40, 40))
+
     def render(self):
         img = self.shown()
         c = self.canvas
         cw, ch = c.winfo_width(), c.winfo_height()
         if img is None or cw < 2 or ch < 2:
             return
-        z = self.zoom
-        if z < 1:
-            if self._cache[0] is not img or self._cache[1] != z:
-                self._cache = (img, z, cv2.resize(img, None, fx=z, fy=z, interpolation=cv2.INTER_AREA))
-            src, M, fl = self._cache[2], np.float32([[1, 0, self.off[0]], [0, 1, self.off[1]]]), cv2.INTER_LINEAR
-        else:
-            src, M = img, np.float32([[z, 0, self.off[0]], [0, z, self.off[1]]])
-            fl = cv2.INTER_NEAREST if z >= 4 else cv2.INTER_LINEAR
-        out = cv2.warpAffine(src, M, (cw, ch), flags=fl, borderMode=cv2.BORDER_CONSTANT, borderValue=(40, 40, 40))
+        out = self._canvas_img(img, cw, ch)
+        split = self.split_on.get() and not self.compare and self.original is not None
+        sx = int(self.split_pos * cw)
+        if split:
+            orig = self.original
+            if orig.shape[:2] != img.shape[:2]:  # edited image has another size: align original to it
+                if self._orig_r is None or self._orig_r[0] != img.shape[:2] or self._orig_r[2] is not orig:
+                    self._orig_r = (img.shape[:2],
+                                    cv2.resize(orig, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_CUBIC), orig)
+                orig = self._orig_r[1]
+            out[:, :sx] = self._canvas_img(orig, cw, ch)[:, :sx]
         rgb = cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
         self._photo = tk.PhotoImage(width=cw, height=ch, data=f"P6 {cw} {ch} 255 ".encode() + rgb.tobytes(), format="PPM")
         c.delete("all")
         c.create_image(0, 0, image=self._photo, anchor="nw")
+        if split:
+            c.create_line(sx, 0, sx, ch, fill="white", width=2)
+            c.create_oval(sx - 14, ch // 2 - 14, sx + 14, ch // 2 + 14, fill="#222", outline="white", width=2)
+            c.create_text(sx, ch // 2, text="<>", fill="white", font=("Arial", 11, "bold"))
+            for x, anchor, t in ((10, "nw", "Original"), (cw - 10, "ne", "Edited")):
+                c.create_text(x + 1, 11, text=t, anchor=anchor, fill="black", font=("Arial", 12, "bold"))
+                c.create_text(x, 10, text=t, anchor=anchor, fill="white", font=("Arial", 12, "bold"))
         if self.pts and not self.compare:
             cp = [self._to_cv(p) for p in self.pts]
             if len(cp) == 4:
@@ -1172,8 +1582,14 @@ class App(tk.Tk):
                 c.create_text(x + 14, y - 14, text=str(i + 1), fill="yellow", font=("Arial", 12, "bold"))
 
     # ---- mouse -----------------------------------------------------------
+    def _near_split(self, x):
+        return self.split_on.get() and self.current is not None and abs(x - self.split_pos * self.canvas.winfo_width()) < 14
+
     def _press(self, e):
         if self.current is None:
+            return
+        if self._near_split(e.x):
+            self._drag_split = True
             return
         if self.persp.pick.get():
             for i, p in enumerate(self.pts):
@@ -1189,13 +1605,19 @@ class App(tk.Tk):
             self._pan_start(e)
 
     def _drag(self, e):
-        if self._drag_idx is not None:
+        if self._drag_split:
+            self.split_pos = min(max(e.x / max(self.canvas.winfo_width(), 1), 0.0), 1.0)
+            self.render()
+        elif self._drag_idx is not None:
             h, w = self.current.shape[:2]
             x, y = self._to_img(e.x, e.y)
             self.pts[self._drag_idx] = [min(max(x, 0), w - 1), min(max(y, 0), h - 1)]
             self.render()
         elif not self.persp.pick.get():
             self._pan_move(e)
+
+    def _release(self, e):
+        self._drag_idx, self._drag_split = None, False
 
     def _pan_start(self, e):
         self._pan = (e.x, e.y, self.off[0], self.off[1])
@@ -1209,6 +1631,7 @@ class App(tk.Tk):
         img = self.shown()
         if img is None:
             return
+        self.canvas.config(cursor="sb_h_double_arrow" if self._near_split(e.x) else "crosshair")
         x, y = self._to_img(e.x, e.y)
         xi, yi = int(x), int(y)
         if 0 <= xi < img.shape[1] and 0 <= yi < img.shape[0]:
@@ -1223,9 +1646,11 @@ class App(tk.Tk):
 
 def main():
     ap = argparse.ArgumentParser(description="Image Lab - edges, perspective, restoration")
-    ap.add_argument("input", nargs="?", help="input image")
-    ap.add_argument("-o", "--output", help="output image (enables CLI mode)")
+    ap.add_argument("input", nargs="?", help="input image (or folder for batch)")
+    ap.add_argument("-o", "--output", help="output image / folder (enables CLI mode)")
     ap.add_argument("-p", "--pipeline", default="", help='e.g. "perspective:quad=auto;unsharp:amount=1.5"')
+    ap.add_argument("--preset", help="JSON preset saved from the GUI (instead of -p)")
+    ap.add_argument("--auto-persp", action="store_true", help="batch: re-detect perspective for every image")
     ap.add_argument("--list", action="store_true", help="list operations and their parameters")
     a = ap.parse_args()
 
@@ -1237,7 +1662,20 @@ def main():
                 print(f"    {p.key} ({p.kind}, default={p.default}){extra}")
         return
     if a.input and a.output:
-        img = run_pipeline(imread(a.input), parse_pipeline(a.pipeline))
+        steps = load_preset(a.preset) if a.preset else parse_pipeline(a.pipeline)
+        if os.path.isdir(a.input):
+            os.makedirs(a.output, exist_ok=True)
+            steps = batch_steps(steps, a.auto_persp)
+            files = list_images(a.input)
+            for i, f in enumerate(files, 1):
+                dst = os.path.join(a.output, os.path.splitext(f)[0] + "_out.png")
+                try:
+                    process_file(os.path.join(a.input, f), dst, steps)
+                    print(f"[{i}/{len(files)}] {f} -> {dst}")
+                except Exception as e:  # noqa
+                    print(f"[{i}/{len(files)}] {f} FAILED: {e}")
+            return
+        img = run_pipeline(imread(a.input), steps)
         imwrite(a.output, img)
         print(f"Saved {a.output}  ({img.shape[1]}x{img.shape[0]})")
         return
