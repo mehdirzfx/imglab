@@ -1192,7 +1192,7 @@ class App(tk.Tk):
     def __init__(self, path=None):
         super().__init__()
         self.title("Image Lab - Edges / Perspective / Restore")
-        self.geometry("1400x880")
+        self.geometry("1355x730")
         self.original = self.current = self.preview = None
         self.history, self.redo_stack, self.recipe = [], [], []
         self.zoom, self.off = 1.0, [0.0, 0.0]
