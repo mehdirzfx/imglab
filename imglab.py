@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# Author : Mehdi Rezaei Far
 """
 Image Lab  -  Edge detection / Perspective correction / Restoration
 ===================================================================
@@ -1682,7 +1683,6 @@ def main():
     if not HAVE_TK:
         sys.exit("tkinter is not installed - use CLI mode (input -o output -p pipeline)")
     App(a.input).mainloop()
-
 
 if __name__ == "__main__":
     main()
