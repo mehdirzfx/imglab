@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# Author : Mehdi Rezaei Far
+# Author: Mehdi Rezaei Far
+
 """
 Image Lab  -  Edge detection / Perspective correction / Restoration
 ===================================================================
 
-GUI:   python image_lab.py [image]
-CLI:   python image_lab.py in.jpg -o out.png -p "perspective:quad=auto,plate=1;unsharp:amount=1.5"
-Batch: python image_lab.py in_folder -o out_folder --preset my.json [--auto-persp]
-List:  python image_lab.py --list
+GUI:   python imglab.py [image]
+CLI:   python imglab.py in.jpg -o out.png -p "perspective:quad=auto,plate=1;unsharp:amount=1.5"
+Batch: python imglab.py in_folder -o out_folder --preset my.json [--auto-persp]
+List:  python imglab.py --list
 
 Requirements:  pip install opencv-python numpy      (tkinter ships with Python)
+Optional:      OCR engines and AI-upscale models install from inside the app (button "Setup...")
+               or from the shell:  python imglab.py --status / --install easyocr model_edsr_x4
 
 Pipeline syntax (CLI):  step;step;...   step = name:key=value,key=value
 Perspective quad:       quad=auto   or   quad=x1|y1|x2|y2|x3|y3|x4|y4
@@ -18,19 +21,26 @@ Perspective quad:       quad=auto   or   quad=x1|y1|x2|y2|x3|y3|x4|y4
 from __future__ import annotations
 
 import argparse
+import importlib
+import importlib.metadata
+import importlib.util
 import json
 import math
 import os
 import queue
 import re
+import subprocess
 import sys
 import threading
 import time
 import types
+import urllib.request
 from dataclasses import dataclass, field
 
 import cv2
 import numpy as np
+
+MODELS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
 
 try:
     import tkinter as tk
@@ -38,7 +48,7 @@ try:
     HAVE_TK = True
 except ImportError:  # CLI still works without tkinter
     HAVE_TK = False
-    tk = ttk = types.SimpleNamespace(Frame=object, Tk=object)
+    tk = ttk = types.SimpleNamespace(Frame=object, Tk=object, Toplevel=object, TclError=Exception)
 
 # ----------------------------------------------------------------------------
 # Helpers
@@ -580,13 +590,15 @@ def upscale(img, factor, method, sharpen):
 
 @register("ai_upscale", "Restore", "AI upscale (EDSR / ESPCN / FSRCNN / LapSRN)",
           "Neural super-resolution. Needs opencv-contrib-python and a .pb model whose name contains the scale, e.g. EDSR_x4.pb. Slow on big images.", [
-    P("model", "Model file (.pb)", "str", "models/EDSR_x4.pb"),
+    P("model", "Model file (.pb)", "str", os.path.join(MODELS_DIR, "EDSR_x4.pb")),
 ])
 def ai_upscale(img, model):
     if not hasattr(cv2, "dnn_superres"):
-        raise RuntimeError("cv2.dnn_superres missing: pip uninstall opencv-python && pip install opencv-contrib-python")
+        raise RuntimeError("The AI upscale engine (opencv-contrib) is not installed - click 'Setup...' and install it.")
+    if not os.path.isfile(model) and os.path.isfile(os.path.join(MODELS_DIR, os.path.basename(model))):
+        model = os.path.join(MODELS_DIR, os.path.basename(model))
     if not os.path.isfile(model):
-        raise FileNotFoundError(f"Model file not found: {model}")
+        raise FileNotFoundError(f"Model file not found: {model}  - click 'Setup...' to download models.")
     name = os.path.basename(model).lower()
     m = re.search(r"x(\d)", name)
     if not m:
@@ -838,30 +850,192 @@ def plate_enhance(img, detect, aspect, height, denoise, fix_blur, contrast, shar
 
 
 # ----------------------------------------------------------------------------
-# OCR (optional)
+# Optional components: OCR engines, AI-upscale engine + models
+# (everything here can be installed from inside the GUI: button "Setup...")
 # ----------------------------------------------------------------------------
 
-OCR_TESS_LANG = "eng"        # e.g. "fas+eng" if the Persian traineddata is installed
-OCR_EASY_LANGS = ["en"]      # e.g. ["fa", "en"]
+OCR_EASY_LANGS = ["fa", "en"]   # EasyOCR languages (fa = Persian)
+OCR_TESS_LANG = "eng"           # Tesseract languages, e.g. "fas+eng"
+_OCR_CACHE = {}
+
+
+def have_module(name):
+    importlib.invalidate_caches()
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def have_dist(name):
+    importlib.invalidate_caches()
+    try:
+        importlib.metadata.distribution(name)
+        return True
+    except importlib.metadata.PackageNotFoundError:
+        return False
+
+
+def ocr_engines():
+    return [n for n, mod in (("easyocr", "easyocr"), ("rapidocr", "rapidocr_onnxruntime"),
+                             ("tesseract", "pytesseract")) if have_module(mod)]
 
 
 def ocr_text(img):
-    g = to_gray(img)
-    tess_err = None
+    """Run the best installed OCR engine (EasyOCR > RapidOCR > Tesseract)."""
+    errs = []
+    if have_module("easyocr"):
+        try:
+            import easyocr
+            key = tuple(OCR_EASY_LANGS)
+            if key not in _OCR_CACHE:  # first run downloads the language models
+                _OCR_CACHE[key] = easyocr.Reader(list(OCR_EASY_LANGS), gpu=False, verbose=False)
+            return " ".join(_OCR_CACHE[key].readtext(ensure_bgr(img), detail=0)).strip()
+        except Exception as e:  # noqa
+            errs.append(f"EasyOCR: {e}")
+    if have_module("rapidocr_onnxruntime"):
+        try:
+            from rapidocr_onnxruntime import RapidOCR
+            eng = _OCR_CACHE.setdefault("rapid", RapidOCR())
+            res, _ = eng(ensure_bgr(img))
+            return " ".join(r[1] for r in res).strip() if res else ""
+        except Exception as e:  # noqa
+            errs.append(f"RapidOCR: {e}")
+    if have_module("pytesseract"):
+        try:
+            import pytesseract
+            return pytesseract.image_to_string(to_gray(img), lang=OCR_TESS_LANG, config="--psm 7").strip()
+        except Exception as e:  # noqa
+            errs.append(f"Tesseract: {e}")
+    raise RuntimeError("; ".join(errs) if errs else "No OCR engine installed (use Setup...)")
+
+
+MODEL_URLS = {
+    "EDSR_x2.pb": "https://github.com/Saafke/EDSR_Tensorflow/raw/master/models/EDSR_x2.pb",
+    "EDSR_x3.pb": "https://github.com/Saafke/EDSR_Tensorflow/raw/master/models/EDSR_x3.pb",
+    "EDSR_x4.pb": "https://github.com/Saafke/EDSR_Tensorflow/raw/master/models/EDSR_x4.pb",
+    "ESPCN_x4.pb": "https://github.com/fannymonori/TF-ESPCN/raw/master/export/ESPCN_x4.pb",
+    "FSRCNN_x4.pb": "https://github.com/Saafke/FSRCNN_Tensorflow/raw/master/models/FSRCNN_x4.pb",
+}
+
+
+def _model_ok(name):
+    p = os.path.join(MODELS_DIR, name)
+    return os.path.isfile(p) and os.path.getsize(p) > 10000
+
+
+def _contrib_status():
+    if hasattr(cv2, "dnn_superres"):
+        return "ok"
+    return "restart" if have_dist("opencv-contrib-python") else "missing"
+
+
+def _ok(flag):
+    return "ok" if flag else "missing"
+
+
+COMPONENTS = {
+    "easyocr": {"title": "OCR engine: EasyOCR  (Persian + English, best quality; big download, installs PyTorch)",
+                "pip": ["easyocr"], "check": lambda: _ok(have_module("easyocr"))},
+    "rapidocr": {"title": "OCR engine: RapidOCR  (small and fast, English letters/digits only)",
+                 "pip": ["rapidocr-onnxruntime"], "check": lambda: _ok(have_module("rapidocr_onnxruntime"))},
+    "contrib": {"title": "AI upscale engine: opencv-contrib  (replaces opencv-python; restart the app afterwards)",
+                "pip": ["opencv-contrib-python"], "uninstall": ["opencv-python", "opencv-python-headless"],
+                "check": _contrib_status},
+    "model_edsr_x4": {"title": "AI upscale model: EDSR x4  (best quality, ~38 MB)", "files": ["EDSR_x4.pb"],
+                      "check": lambda: _ok(_model_ok("EDSR_x4.pb"))},
+    "model_edsr_x2": {"title": "AI upscale model: EDSR x2 / x3  (~38 MB each)", "files": ["EDSR_x2.pb", "EDSR_x3.pb"],
+                      "check": lambda: _ok(_model_ok("EDSR_x2.pb") and _model_ok("EDSR_x3.pb"))},
+    "model_fast": {"title": "AI upscale models: ESPCN x4 + FSRCNN x4  (tiny and fast, lower quality)",
+                   "files": ["ESPCN_x4.pb", "FSRCNN_x4.pb"],
+                   "check": lambda: _ok(_model_ok("ESPCN_x4.pb") and _model_ok("FSRCNN_x4.pb"))},
+}
+
+
+def run_pip(args, log):
+    """Run `python -m pip <args>` streaming output to log(); retries once for 'externally managed' Pythons."""
+    flags = 0x08000000 if os.name == "nt" else 0  # no console window on Windows
+    out = []
+    for attempt in (0, 1):
+        cmd = [sys.executable, "-m", "pip", *args] + (["--break-system-packages"] if attempt else [])
+        out = []
+        try:
+            p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                 bufsize=1, creationflags=flags)
+        except OSError as e:
+            log(f"Cannot run pip: {e}")
+            return False
+        for line in p.stdout:
+            out.append(line)
+            log(line.rstrip())
+        if p.wait() == 0:
+            return True
+        if attempt == 0 and args[0] in ("install", "uninstall") and "externally-managed-environment" in "".join(out):
+            log("System Python is 'externally managed' - retrying with --break-system-packages ...")
+            continue
+        return False
+    return False
+
+
+def download_file(url, dst, log):
+    req = urllib.request.Request(url, headers={"User-Agent": "imglab"})
+    with urllib.request.urlopen(req, timeout=60) as r, open(dst + ".part", "wb") as f:
+        total, done, last = int(r.headers.get("Content-Length") or 0), 0, -1
+        while True:
+            chunk = r.read(1 << 16)
+            if not chunk:
+                break
+            f.write(chunk)
+            done += len(chunk)
+            if total and done * 10 // total != last:
+                last = done * 10 // total
+                log(f"  {done * 100 // total}%")
+    os.replace(dst + ".part", dst)
+
+
+def install_component(key, log):
+    """Install one COMPONENTS entry. Returns (ok, message)."""
+    c = COMPONENTS[key]
     try:
-        import pytesseract
-        return pytesseract.image_to_string(g, lang=OCR_TESS_LANG, config="--psm 7").strip()
-    except ImportError:
-        pass
-    except Exception as e:  # Tesseract binary missing, bad language ...
-        tess_err = e
-    try:
-        import easyocr
-    except ImportError:
-        raise RuntimeError(str(tess_err) if tess_err else
-                           "OCR needs pytesseract (+Tesseract) or easyocr:  pip install easyocr")
-    reader = easyocr.Reader(OCR_EASY_LANGS, gpu=False, verbose=False)
-    return " ".join(reader.readtext(ensure_bgr(img), detail=0)).strip()
+        if "files" in c:
+            os.makedirs(MODELS_DIR, exist_ok=True)
+            for fn in c["files"]:
+                if _model_ok(fn):
+                    log(f"{fn}: already present")
+                    continue
+                log(f"Downloading {fn} ...")
+                try:
+                    download_file(MODEL_URLS[fn], os.path.join(MODELS_DIR, fn), log)
+                except Exception as e:  # noqa
+                    return False, (f"Download failed ({e}).\nDownload it manually from\n  {MODEL_URLS[fn]}\n"
+                                   f"and put it in:\n  {MODELS_DIR}")
+            return True, "Models ready."
+        had_contrib = have_dist("opencv-contrib-python")
+        present = [d for d in c.get("uninstall", []) if have_dist(d)]
+        if present:
+            log("Removing conflicting packages: " + ", ".join(present))
+            if not run_pip(["uninstall", "-y", *present], log):
+                return False, ("Could not remove the old OpenCV (files in use?). Close the app and run:\n"
+                               "  pip uninstall -y opencv-python opencv-python-headless\n"
+                               "  pip install opencv-contrib-python")
+        ok = run_pip(["install", "--progress-bar", "off", *c["pip"]], log)
+        if not ok and present:
+            log("Install failed - restoring previous packages ...")
+            run_pip(["install", "--progress-bar", "off", *present], log)
+        importlib.invalidate_caches()
+        if ok and had_contrib and key != "contrib":
+            # OCR packages depend on plain opencv-python, which would overwrite opencv-contrib's cv2 files
+            extra = [d for d in ("opencv-python", "opencv-python-headless") if have_dist(d)]
+            if extra:
+                log("Restoring opencv-contrib (a dependency pulled in plain OpenCV) ...")
+                run_pip(["uninstall", "-y", *extra], log)
+                run_pip(["install", "--force-reinstall", "--no-deps", "--progress-bar", "off",
+                         "opencv-contrib-python"], log)
+        if not ok:
+            return False, "pip failed - see the log above (internet connection?)."
+        return True, "Installed. Restart the app to use it." if key == "contrib" else "Installed."
+    except Exception as e:  # noqa
+        return False, str(e)
 
 
 # ----------------------------------------------------------------------------
@@ -1188,11 +1362,91 @@ class PipelinePanel(ttk.Frame):
             self.app.start_batch(src, dst, self.auto_persp.get())
 
 
+class SetupDialog(tk.Toplevel):
+    """Install optional components (OCR engines, AI-upscale engine and models) without leaving the app."""
+
+    STATUS = {"ok": "Installed", "missing": "Not installed", "restart": "Restart the app"}
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.title("Setup - optional components")
+        self.geometry("820x560")
+        self.q, self.busy, self.rows = queue.Queue(), False, {}
+        ttk.Label(self, wraplength=780, justify="left", foreground="#777",
+                  text="Install only what you need. Downloads need an internet connection. "
+                       "Models are saved next to the program in the 'models' folder.").pack(fill="x", padx=10, pady=(10, 2))
+        frm = ttk.Frame(self)
+        frm.pack(fill="x", padx=10, pady=4)
+        for key, c in COMPONENTS.items():
+            row = ttk.Frame(frm)
+            row.pack(fill="x", pady=3)
+            ttk.Label(row, text=c["title"], wraplength=520, justify="left").pack(side="left", fill="x", expand=True)
+            st = ttk.Label(row, width=16)
+            st.pack(side="left", padx=6)
+            btn = ttk.Button(row, text="Install", width=9, command=lambda k=key: self.install(k))
+            btn.pack(side="right")
+            self.rows[key] = (st, btn)
+        box = ttk.Frame(self)
+        box.pack(fill="both", expand=True, padx=10, pady=8)
+        self.log = tk.Text(box, height=14, state="disabled", wrap="word")
+        sb = ttk.Scrollbar(box, command=self.log.yview)
+        self.log.config(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self.log.pack(side="left", fill="both", expand=True)
+        self.refresh()
+        self.after(80, self._poll)
+
+    def refresh(self):
+        for key, (st, btn) in self.rows.items():
+            s = COMPONENTS[key]["check"]()
+            st.config(text=self.STATUS.get(s, s))
+            btn.config(state="disabled" if (s == "ok" or self.busy) else "normal")
+
+    def write(self, text):
+        self.log.config(state="normal")
+        self.log.insert("end", text + "\n")
+        self.log.see("end")
+        self.log.config(state="disabled")
+
+    def install(self, key):
+        if self.busy:
+            return
+        self.busy = True
+        self.refresh()
+        self.write(f"=== {COMPONENTS[key]['title']} ===")
+
+        def work():
+            ok, msg = install_component(key, lambda t: self.q.put(("log", t)))
+            self.q.put(("done", ok, msg))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _poll(self):
+        try:
+            while True:
+                item = self.q.get_nowait()
+                if item[0] == "log":
+                    self.write(item[1])
+                else:
+                    self.busy = False
+                    self.write(("OK: " if item[1] else "FAILED: ") + item[2] + "\n")
+                    self.refresh()
+        except queue.Empty:
+            pass
+        except tk.TclError:
+            return
+        try:
+            if self.winfo_exists():
+                self.after(80, self._poll)
+        except tk.TclError:
+            pass
+
+
 class App(tk.Tk):
     def __init__(self, path=None):
         super().__init__()
         self.title("Image Lab - Edges / Perspective / Restore")
         self.geometry("1355x730")
+        self.minsize(900, 560)
         self.original = self.current = self.preview = None
         self.history, self.redo_stack, self.recipe = [], [], []
         self.zoom, self.off = 1.0, [0.0, 0.0]
@@ -1220,11 +1474,12 @@ class App(tk.Tk):
         top.pack(fill="x")
         for text, cmd in [("Open", self.open), ("Save", self.save), ("Undo", self.undo), ("Redo", self.redo),
                           ("Reset", self.reset), ("Fit", self.fit), ("1:1", self.one_to_one),
-                          ("OCR", self.do_ocr), ("Copy CLI recipe", self.copy_recipe)]:
+                          ("OCR", self.do_ocr), ("Copy CLI recipe", self.copy_recipe),
+                          ("Setup...", self.open_setup)]:
             ttk.Button(top, text=text, command=cmd).pack(side="left", padx=2, pady=4)
         ttk.Checkbutton(top, text="Split view (original | edited)", variable=self.split_on,
                         command=self.render).pack(side="left", padx=10)
-        b = ttk.Button(top, text="Hold: show original")
+        b = ttk.Button(top, text="Hold: original")
         b.pack(side="left", padx=4)
         b.bind("<ButtonPress-1>", lambda e: self.set_compare(True))
         b.bind("<ButtonRelease-1>", lambda e: self.set_compare(False))
@@ -1310,12 +1565,25 @@ class App(tk.Tk):
         self.clipboard_append(s)
         self.msg.set("CLI pipeline copied: " + (s[:90] + "..." if len(s) > 90 else s))
 
-    # ---- OCR / batch (background work, results via aux_q) -----------------
+    # ---- setup / OCR / batch (background work, results via aux_q) ----------
+    def open_setup(self):
+        try:
+            if getattr(self, "_setup", None) is not None and self._setup.winfo_exists():
+                self._setup.lift()
+                return
+        except tk.TclError:
+            pass
+        self._setup = SetupDialog(self)
+
     def do_ocr(self):
         img = self.preview if self.preview is not None else self.current
         if img is None:
             return
-        self.msg.set("Running OCR ...")
+        if not ocr_engines():
+            if messagebox.askyesno("OCR", "No OCR engine is installed.\nOpen Setup to install one now?"):
+                self.open_setup()
+            return
+        self.msg.set("Running OCR (the first run may download language models) ...")
 
         def work():
             try:
@@ -1653,7 +1921,22 @@ def main():
     ap.add_argument("--preset", help="JSON preset saved from the GUI (instead of -p)")
     ap.add_argument("--auto-persp", action="store_true", help="batch: re-detect perspective for every image")
     ap.add_argument("--list", action="store_true", help="list operations and their parameters")
+    ap.add_argument("--status", action="store_true", help="show which optional components are installed")
+    ap.add_argument("--install", nargs="+", choices=list(COMPONENTS), metavar="NAME",
+                    help="install optional components: " + ", ".join(COMPONENTS))
     a = ap.parse_args()
+
+    if a.status:
+        for k, c in COMPONENTS.items():
+            print(f"{k:15s} {c['check']():8s} {c['title']}")
+        return
+    if a.install:
+        bad = 0
+        for k in a.install:
+            ok, msg = install_component(k, print)
+            print(f"[{k}] {'OK' if ok else 'FAILED'}: {msg}")
+            bad += not ok
+        sys.exit(1 if bad else 0)
 
     if a.list:
         for op in OPS.values():

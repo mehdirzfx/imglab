@@ -1,0 +1,5 @@
+opencv-python>=4.5
+numpy>=1.21
+# Optional (can be installed from the app: Setup... or `python imglab.py --install <name>`):
+#   easyocr / rapidocr-onnxruntime   OCR
+#   opencv-contrib-python            AI upscale (replaces opencv-python)

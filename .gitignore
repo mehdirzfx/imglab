@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+models/
+.venv/
+venv/
+*_out.png
