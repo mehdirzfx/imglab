@@ -33,12 +33,15 @@ import threading
 import time
 import types
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import cv2
 import numpy as np
 
-MODELS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+__version__ = "1.0.0"
+FROZEN = bool(getattr(sys, "frozen", False))  # running as a PyInstaller executable (no pip available)
+APP_DIR = os.path.dirname(sys.executable) if FROZEN else os.path.dirname(os.path.abspath(__file__))
+MODELS_DIR = os.path.join(APP_DIR, "models")
 
 try:
     import tkinter as tk
@@ -395,28 +398,40 @@ def median(img, ksize):
     return cv2.medianBlur(img, odd(ksize))
 
 
-def detect_block_size(img, max_b=48):
-    """Return the pixel-block size of a pixelated/mosaic image, or 1 if none."""
+def detect_block_size(img, max_b=48, min_share=0.7):
+    """Return the pixel-block size of a pixelated/mosaic image, or 1 if none.
+
+    In a mosaic every brightness change happens on the block borders, so for the true block size
+    (almost) all gradient energy sits on a single column/row phase. Smaller divisors of the block
+    size hold that energy too, multiples of it do not - so the largest period that still holds it
+    is the block size. A normal photo or drawing spreads its edges over all phases and returns 1.
+    """
     g = to_gray(img).astype(np.float32)
     dx = np.abs(np.diff(g, axis=1)).mean(axis=0)
     dy = np.abs(np.diff(g, axis=0)).mean(axis=1)
 
-    def ratio(d, c):
-        best, tot, n = 0.0, d.sum(), len(d)
+    def share(d, c):
+        """Best fraction of the gradient energy lying on one phase of period c (None: no variation)."""
+        tot, n = float(d.sum()), len(d)
+        if tot < 1e-6:
+            return None
+        best = 0.0
         for p in range(c):
             sel = d[p::c]
             if len(sel) < 3 or n - len(sel) <= 0:
                 continue
-            inner = (tot - sel.sum()) / (n - len(sel))
-            best = max(best, float(sel.mean() / (inner + 1e-3)))
+            inner = (tot - float(sel.sum())) / (n - len(sel))
+            active = int((sel > 0.05 * sel.max()).sum())
+            if active >= 4 and sel.mean() / (inner + 1e-3) >= 2.5:  # a lone rectangle is not a mosaic
+                best = max(best, float(sel.sum()) / tot)
         return best
 
-    best_c, best_r = 1, 0.0
+    found = 1
     for c in range(2, max_b + 1):
-        r = 0.5 * (ratio(dx, c) + ratio(dy, c))
-        if r > best_r:
-            best_c, best_r = c, r
-    return best_c if best_r >= 2.5 else 1
+        s = [v for v in (share(dx, c), share(dy, c)) if v is not None]
+        if s and min(s) >= min_share:
+            found = c
+    return found
 
 
 @register("depixelate", "Restore", "De-pixelate / de-mosaic", "Detects blocky pixels (auto) and rebuilds a smooth image.", [
@@ -517,13 +532,19 @@ def richardson_lucy(img, psf, iters):
     return np.clip(est, 0, 255)
 
 
-def estimate_motion_blur(img, max_len=40):
-    """Estimate (length, angle_deg, found) of linear motion blur via the cepstrum."""
-    g = to_gray(img).astype(np.float32)
+def estimate_motion_blur(img, max_len=40, return_score=False, min_conf=10.0):
+    """Estimate (length, angle_deg, found) of linear motion blur via the cepstrum.
+
+    `found` is True when the confidence (z-score of the cepstral dip) exceeds `min_conf`. This is a
+    heuristic: strong, linear blur of up to ~25 px is detected reliably, while very long blur is missed
+    and sharp images with very regular fine structure (thin repeated text) can be mistaken for blur.
+    With return_score=True the confidence is returned as a 4th value.
+    """
+    g = to_gray(img).astype(np.float64)  # float64: results must not depend on the NumPy version
     s = min(min(g.shape), 512)
     y0, x0 = (g.shape[0] - s) // 2, (g.shape[1] - s) // 2
     g = g[y0:y0 + s, x0:x0 + s]
-    g = (g - g.mean()) * np.outer(np.hanning(s), np.hanning(s)).astype(np.float32)
+    g = (g - g.mean()) * np.outer(np.hanning(s), np.hanning(s))
     spec = np.log(np.abs(np.fft.fft2(g)) + 1e-2)
     cep = np.fft.fftshift(np.real(np.fft.ifft2(spec)))
     c = s // 2
@@ -539,7 +560,8 @@ def estimate_motion_blur(img, max_len=40):
         angle -= 180
     if angle <= -90:
         angle += 180
-    return math.hypot(dx, dy), angle, bool(z > 8.0)
+    res = (math.hypot(dx, dy), angle, bool(z > min_conf))
+    return res + (float(z),) if return_score else res
 
 
 @register("auto_deblur", "Restore", "Auto deblur (estimates the blur)", "Detects motion-blur length/angle from the image itself, then deconvolves. Falls back to Gaussian if no motion found.", [
@@ -548,9 +570,10 @@ def estimate_motion_blur(img, max_len=40):
     P("iters", "Iterations (Richardson-Lucy)", "int", 15, 1, 60, 1),
     P("max_len", "Max blur length", "int", 40, 5, 100, 1),
     P("fallback", "Gaussian size if no motion found (0 = skip)", "float", 0.0, 0.0, 6.0, 0.1),
+    P("min_conf", "Min. confidence (lower = detects weaker blur)", "float", 10.0, 4.0, 30.0, 0.5),
 ])
-def auto_deblur(img, method, noise, iters, max_len, fallback):
-    L, ang, ok = estimate_motion_blur(img, max_len)
+def auto_deblur(img, method, noise, iters, max_len, fallback, min_conf=10.0):
+    L, ang, ok = estimate_motion_blur(img, max_len, min_conf=min_conf)
     if ok:
         kind, size, angle = "motion", L, ang
     elif fallback > 0:
@@ -596,7 +619,7 @@ def ai_upscale(img, model):
     if not os.path.isfile(model) and os.path.isfile(os.path.join(MODELS_DIR, os.path.basename(model))):
         model = os.path.join(MODELS_DIR, os.path.basename(model))
     if not os.path.isfile(model):
-        raise FileNotFoundError(f"Model file not found: {model}  - click 'Setup...' to download models.")
+        raise FileNotFoundError(f"Model file not found: {model}  - download one with 'Setup...' in the app or `--install model_edsr_x4` on the command line.")
     name = os.path.basename(model).lower()
     m = re.search(r"x(\d)", name)
     if not m:
@@ -682,23 +705,49 @@ def flip(img, mode):
     }[mode](img)
 
 
-@register("deskew", "Geometry", "Auto deskew (straighten text / lines)", "Finds the dominant near-horizontal line angle with Hough and rotates it level.", [
-    P("max_angle", "Max angle to correct", "float", 15.0, 1.0, 45.0, 1.0),
-    P("expand", "Expand canvas", "bool", True),
-])
-def deskew(img, max_angle, expand):
+def _skew_once(img, max_angle):
     g = to_gray(img)
     e = cv2.Canny(cv2.GaussianBlur(g, (3, 3), 0), 50, 150)
     lines = cv2.HoughLinesP(e, 1, np.pi / 720, threshold=60, minLineLength=max(20, min(g.shape) // 6), maxLineGap=10)
     if lines is None:
-        return img
-    angs = []
+        return None
+    angs, wts = [], []
     for x1, y1, x2, y2 in lines.reshape(-1, 4):
         a = math.degrees(math.atan2(y2 - y1, x2 - x1))
         a = a - 180 if a > 90 else (a + 180 if a < -90 else a)
         if abs(a) <= max_angle:
             angs.append(a)
-    return rotate(img, float(np.median(angs)), expand) if angs else img
+            wts.append(math.hypot(x2 - x1, y2 - y1))  # long lines (baselines, rules) matter most
+    if not angs:
+        return None
+    order = np.argsort(angs)
+    angs, wts = np.asarray(angs)[order], np.asarray(wts)[order]
+    return float(angs[np.searchsorted(np.cumsum(wts), wts.sum() / 2)])  # length-weighted median
+
+
+def estimate_skew(img, max_angle=15.0, refine=2):
+    """Angle (degrees, counter-clockwise positive) the image must be rotated by to level its dominant
+    near-horizontal lines, or None if no such lines are found. Each refinement pass re-measures the
+    small residual left after rotating by the estimate so far."""
+    total = 0.0
+    for i in range(1 + refine):
+        cur = img if i == 0 else rotate(img, total, True)
+        a = _skew_once(cur, max_angle)
+        if a is None:
+            return None if i == 0 else total
+        total += a
+        if abs(a) < 0.1:
+            break
+    return total
+
+
+@register("deskew", "Geometry", "Auto deskew (straighten text / lines)", "Finds the dominant near-horizontal line angle with Hough and rotates it level.", [
+    P("max_angle", "Max angle to correct", "float", 15.0, 1.0, 45.0, 1.0),
+    P("expand", "Expand canvas", "bool", True),
+])
+def deskew(img, max_angle, expand):
+    angle = estimate_skew(img, max_angle)
+    return img if angle is None else rotate(img, angle, expand)
 
 
 # ----------------------------------------------------------------------------
@@ -1008,6 +1057,9 @@ def install_component(key, log):
                     return False, (f"Download failed ({e}).\nDownload it manually from\n  {MODEL_URLS[fn]}\n"
                                    f"and put it in:\n  {MODELS_DIR}")
             return True, "Models ready."
+        if FROZEN:  # sys.executable is the app itself here, so `python -m pip` is impossible
+            return False, ("This standalone build cannot install Python packages. "
+                           "Run imglab.py from source (pip install ...) to use this component.")
         had_contrib = have_dist("opencv-contrib-python")
         present = [d for d in c.get("uninstall", []) if have_dist(d)]
         if present:
@@ -1363,7 +1415,8 @@ class PipelinePanel(ttk.Frame):
 class SetupDialog(tk.Toplevel):
     """Install optional components (OCR engines, AI-upscale engine and models) without leaving the app."""
 
-    STATUS = {"ok": "Installed", "missing": "Not installed", "restart": "Restart the app"}
+    STATUS = {"ok": "Installed", "missing": "Not installed", "restart": "Restart the app",
+              "unavailable": "Source install only"}
 
     def __init__(self, app):
         super().__init__(app)
@@ -1397,8 +1450,10 @@ class SetupDialog(tk.Toplevel):
     def refresh(self):
         for key, (st, btn) in self.rows.items():
             s = COMPONENTS[key]["check"]()
+            if FROZEN and "pip" in COMPONENTS[key] and s != "ok":
+                s = "unavailable"  # packages cannot be installed into a standalone executable
             st.config(text=self.STATUS.get(s, s))
-            btn.config(state="disabled" if (s == "ok" or self.busy) else "normal")
+            btn.config(state="disabled" if (s in ("ok", "unavailable") or self.busy) else "normal")
 
     def write(self, text):
         self.log.config(state="normal")
@@ -1579,7 +1634,10 @@ class App(tk.Tk):
         if img is None:
             return
         if not ocr_engines():
-            if messagebox.askyesno("OCR", "No OCR engine is installed.\nOpen Setup to install one now?"):
+            if FROZEN:
+                messagebox.showinfo("OCR", "OCR engines are not included in the standalone build.\n"
+                                           "Run imglab.py from source and install one from Setup.")
+            elif messagebox.askyesno("OCR", "No OCR engine is installed.\nOpen Setup to install one now?"):
                 self.open_setup()
             return
         self.msg.set("Running OCR (the first run may download language models) ...")
@@ -1986,6 +2044,7 @@ def main():
     ap.add_argument("-p", "--pipeline", default="", help='e.g. "perspective:quad=auto;unsharp:amount=1.5"')
     ap.add_argument("--preset", help="JSON preset saved from the GUI (instead of -p)")
     ap.add_argument("--auto-persp", action="store_true", help="batch: re-detect perspective for every image")
+    ap.add_argument("--version", action="version", version=f"imglab {__version__}")
     ap.add_argument("--list", action="store_true", help="list operations and their parameters")
     ap.add_argument("--status", action="store_true", help="show which optional components are installed")
     ap.add_argument("--install", nargs="+", choices=list(COMPONENTS), metavar="NAME",
@@ -1995,6 +2054,7 @@ def main():
     if a.status:
         for k, c in COMPONENTS.items():
             print(f"{k:15s} {c['check']():8s} {c['title']}")
+        print(f"\nmodels folder: {MODELS_DIR}" + ("   (standalone build)" if FROZEN else ""))
         return
     if a.install:
         bad = 0
@@ -2012,23 +2072,28 @@ def main():
                 print(f"    {p.key} ({p.kind}, default={p.default}){extra}")
         return
     if a.input and a.output:
-        steps = load_preset(a.preset) if a.preset else parse_pipeline(a.pipeline)
-        if os.path.isdir(a.input):
-            os.makedirs(a.output, exist_ok=True)
-            steps = batch_steps(steps, a.auto_persp)
-            files = list_images(a.input)
-            for i, f in enumerate(files, 1):
-                dst = os.path.join(a.output, os.path.splitext(f)[0] + "_out.png")
-                try:
-                    process_file(os.path.join(a.input, f), dst, steps)
-                    print(f"[{i}/{len(files)}] {f} -> {dst}")
-                except Exception as e:  # noqa
-                    print(f"[{i}/{len(files)}] {f} FAILED: {e}")
+        try:
+            steps = load_preset(a.preset) if a.preset else parse_pipeline(a.pipeline)
+            if os.path.isdir(a.input):
+                os.makedirs(a.output, exist_ok=True)
+                steps = batch_steps(steps, a.auto_persp)
+                files = list_images(a.input)
+                failed = 0
+                for i, f in enumerate(files, 1):
+                    dst = os.path.join(a.output, os.path.splitext(f)[0] + "_out.png")
+                    try:
+                        process_file(os.path.join(a.input, f), dst, steps)
+                        print(f"[{i}/{len(files)}] {f} -> {dst}")
+                    except Exception as e:  # noqa
+                        failed += 1
+                        print(f"[{i}/{len(files)}] {f} FAILED: {e}")
+                sys.exit(1 if failed else 0)
+            img = run_pipeline(imread(a.input), steps)
+            imwrite(a.output, img)
+            print(f"Saved {a.output}  ({img.shape[1]}x{img.shape[0]})")
             return
-        img = run_pipeline(imread(a.input), steps)
-        imwrite(a.output, img)
-        print(f"Saved {a.output}  ({img.shape[1]}x{img.shape[0]})")
-        return
+        except (KeyError, ValueError, OSError, RuntimeError) as e:  # clean message instead of a traceback
+            sys.exit(f"error: {e}")
     if not HAVE_TK:
         sys.exit("tkinter is not installed - use CLI mode (input -o output -p pipeline)")
     App(a.input).mainloop()

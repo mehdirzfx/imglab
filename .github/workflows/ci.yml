@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff
+      - run: ruff check .
+
+  test:
+    name: test (${{ matrix.os }}, py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, python: "3.9" }
+          - { os: ubuntu-latest, python: "3.11" }
+          - { os: ubuntu-latest, python: "3.13" }
+          - { os: windows-latest, python: "3.12" }
+          - { os: macos-latest, python: "3.12" }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      # headless OpenCV: the tests never open an OpenCV window and it avoids missing libGL on runners
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install opencv-python-headless numpy pytest
+
+      - name: Install Tk and a virtual display (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y xvfb python3-tk
+
+      - name: Run tests (Linux, with a virtual display so the GUI tests run)
+        if: runner.os == 'Linux'
+        run: xvfb-run -a python -m pytest -v
+
+      - name: Run tests (Windows / macOS, GUI tests are skipped)
+        if: runner.os != 'Linux'
+        run: python -m pytest -v
+
+  cli-smoke:
+    # the program as a user runs it, without pytest: list operations, process an image, report components
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install opencv-python-headless numpy
+      - run: python imglab.py --version && python imglab.py --list > /dev/null && python imglab.py --status
+      - name: Process a generated image
+        run: |
+          python - <<'PY'
+          import cv2, numpy as np
+          img = np.full((300, 500, 3), 200, np.uint8)
+          cv2.putText(img, "imglab CI", (30, 160), cv2.FONT_HERSHEY_SIMPLEX, 2, (20, 20, 20), 4)
+          cv2.imwrite("sample.png", img)
+          PY
+          python imglab.py sample.png -o out.png -p "canny;morphology:operation=dilate"
+          python -c "import cv2; assert cv2.imread('out.png') is not None"

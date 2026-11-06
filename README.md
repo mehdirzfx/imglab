@@ -1,5 +1,8 @@
 # imglab
 
+[![CI](https://github.com/mehdirzfx/imglab/actions/workflows/ci.yml/badge.svg)](https://github.com/mehdirzfx/imglab/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/mehdirzfx/imglab)](https://github.com/mehdirzfx/imglab/releases/latest)
+
 A single-file Python toolkit for **finding edges, straightening perspective (license plates, documents, signs) and restoring poor-quality images**. It has a desktop GUI with a live **original | edited split view**, and a command-line mode for scripts and batch jobs.
 
 ![Examples](docs/examples.png)
@@ -26,6 +29,26 @@ A single-file Python toolkit for **finding edges, straightening perspective (lic
 | ![Split view](docs/gui-split.png) | ![Perspective](docs/gui-perspective.png) | ![Setup](docs/gui-setup.png) |
 
 ## Install
+
+### Standalone download (no Python needed)
+
+Grab the latest build from the [Releases page](https://github.com/mehdirzfx/imglab/releases/latest):
+
+| File | For |
+|---|---|
+| `imglab-windows-x64.exe` | Windows, double-click to start the GUI |
+| `imglab-cli-windows-x64.exe` | Windows, command-line use (`imglab-cli-windows-x64.exe photo.jpg -o out.png -p "..."`) |
+| `imglab-linux-x64` | Linux (`chmod +x` it first) |
+
+Compare the download with `SHA256SUMS.txt` from the same release. Notes on the standalone builds:
+
+- Each file is about 100 MB because OpenCV is bundled. The first start takes a few seconds while it unpacks.
+- The Windows `.exe` is not code-signed, so SmartScreen may warn on first run ("More info" → "Run anyway"). If you prefer, run from source instead.
+- AI upscale works (the OpenCV contrib build is bundled): *Setup…* downloads the model files into a `models` folder next to the program.
+- OCR engines and other Python packages **cannot** be installed into a standalone build (there is no `pip` inside it). *Setup…* shows them as "Source install only". For OCR, run from source.
+- There is no macOS build yet; use the source install below.
+
+### From source
 
 ```bash
 git clone https://github.com/mehdirzfx/imglab.git
@@ -112,6 +135,7 @@ Notes:
 - **Restoration cannot invent lost detail.** De-pixelate rebuilds a smooth image from the detected blocks; it does not recover the original pixels. Deblur works best on uniform linear motion blur or a known Gaussian blur and can leave ringing around strong edges; raise *Noise* to reduce it. For noisy real photos, try *Richardson–Lucy* or lower the strength.
 - Neural **AI upscale** is the only mode that adds plausible new detail, and it is slow on large images.
 - Perspective **auto-detect** looks for a convex four-sided shape with strong edges. It can pick the wrong object in cluttered scenes — use *Next candidate* or place the corners by hand.
+- **Auto deblur** is a heuristic: it detects strong linear motion blur up to about 25 px. Very long blur is missed, and a sharp image with very regular fine structure (for example thin repeated text) can occasionally be mistaken for blur. The *Min. confidence* slider controls how eager it is; use the manual *Deblur* when you know the blur. Auto deskew is typically accurate to well under a degree.
 - **OCR** quality depends on the engine and the plate style; the bundled engines are general-purpose, not plate-specific. Always check the output.
 - Very large images make some operations (NL-means, Wiener on huge frames, AI upscale) slow. Previews run in a background thread, so the window stays responsive.
 
@@ -120,11 +144,30 @@ Notes:
 ```
 imglab.py         the whole program (operations registry, GUI, CLI, installer)
 requirements.txt  core dependencies
+tests/            pytest suite (operations, pipeline/presets, CLI, installer, GUI)
+.github/          CI and release workflows
+pyproject.toml    ruff / pytest settings (not a package)
 docs/             screenshots and example images
 models/           created on demand for AI-upscale models (git-ignored)
 ```
 
 Operations are registered with a small decorator (`@register(name, category, label, description, params)`); adding a new filter means writing one function and its parameter list — it then appears in the GUI, the CLI (`-p "name:key=value"`), presets and batch mode automatically.
+
+## Development
+
+```bash
+pip install opencv-python-headless numpy pytest ruff
+ruff check .
+pytest                      # GUI tests are skipped without a display
+xvfb-run -a pytest          # Linux: run them under a virtual display
+```
+
+- **CI** (`.github/workflows/ci.yml`) runs on every push and pull request: lint, the test suite on Linux (Python 3.9 / 3.11 / 3.13, with a virtual display for the GUI tests), Windows and macOS (Python 3.12, GUI tests skipped), and a command-line smoke test.
+- **Releases** (`.github/workflows/release.yml`): bump `__version__` in `imglab.py`, commit, then
+  ```bash
+  git tag v1.0.1 && git push origin v1.0.1
+  ```
+  The workflow checks the tag against `__version__`, builds the Windows and Linux programs with PyInstaller, smoke-tests them, and attaches them with checksums to a GitHub Release. It can also be started by hand from the Actions tab to build without publishing.
 
 ## Author
 

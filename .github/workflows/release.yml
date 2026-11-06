@@ -1,0 +1,112 @@
+name: Release
+
+# Push a tag such as v1.0.1 to build standalone programs (Windows .exe, Linux binary)
+# and attach them to a GitHub Release. "Run workflow" builds them without publishing.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: windows, os: windows-latest }
+          # built on an older Ubuntu so the binary also runs on older distributions
+          - { name: linux, os: ubuntu-22.04 }
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check that the tag matches __version__
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          python - <<'PY'
+          import os, re, sys
+          version = re.search(r'__version__ = "(.+?)"', open("imglab.py", encoding="utf-8").read()).group(1)
+          tag = os.environ["TAG"].lstrip("v")
+          sys.exit(0 if version == tag else f"tag {tag} does not match __version__ {version} in imglab.py")
+          PY
+
+      - name: Install Tk (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y python3-tk
+
+      # the contrib build includes cv2.dnn_superres, so AI upscale works once a model file is downloaded
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install opencv-contrib-python-headless numpy pyinstaller
+
+      - name: Build (Windows) - windowed GUI program and a console program for the command line
+        if: runner.os == 'Windows'
+        run: |
+          pyinstaller --noconfirm --onefile --windowed --name imglab imglab.py
+          pyinstaller --noconfirm --onefile --name imglab-cli imglab.py
+          mkdir release
+          cp dist/imglab.exe release/imglab-windows-x64.exe
+          cp dist/imglab-cli.exe release/imglab-cli-windows-x64.exe
+
+      - name: Build (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          pyinstaller --noconfirm --onefile --name imglab imglab.py
+          mkdir release
+          cp dist/imglab release/imglab-linux-x64
+          chmod +x release/imglab-linux-x64
+
+      - name: Smoke-test the built program
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then BIN=release/imglab-cli-windows-x64.exe; else BIN=release/imglab-linux-x64; fi
+          "$BIN" --version
+          "$BIN" --list > /dev/null
+          "$BIN" --status
+          python - <<'PY'
+          import cv2, numpy as np
+          img = np.full((300, 500, 3), 200, np.uint8)
+          cv2.putText(img, "imglab", (40, 160), cv2.FONT_HERSHEY_SIMPLEX, 2.5, (20, 20, 20), 5)
+          cv2.imwrite("sample.png", img)
+          PY
+          "$BIN" sample.png -o out.png -p "canny;unsharp:amount=1"
+          python -c "import cv2; assert cv2.imread('out.png') is not None"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: imglab-${{ matrix.name }}
+          path: release/*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the release and upload files
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release
+          merge-multiple: true
+
+      - name: Checksums
+        run: cd release && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true

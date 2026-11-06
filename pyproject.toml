@@ -1,0 +1,11 @@
+# Tool configuration only - imglab is a single-file program, not an installable package.
+[tool.ruff]
+line-length = 140
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+ignore = ["E731", "E741", "E701", "E702", "E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
