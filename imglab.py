@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# Author: Mehdi Rezaei Far
-
 """
 Image Lab  -  Edge detection / Perspective correction / Restoration
 ===================================================================
@@ -1454,6 +1452,7 @@ class App(tk.Tk):
         self.compare = False
         self.split_on = tk.BooleanVar(value=False)
         self.split_pos = 0.5
+        self.zoom_o, self.off_o, self._viewkey = 1.0, [0.0, 0.0], None
         self._drag_split = False
         self.q, self.aux_q = queue.Queue(), queue.Queue()
         self.req = 0
@@ -1478,7 +1477,7 @@ class App(tk.Tk):
                           ("Setup...", self.open_setup)]:
             ttk.Button(top, text=text, command=cmd).pack(side="left", padx=2, pady=4)
         ttk.Checkbutton(top, text="Split view (original | edited)", variable=self.split_on,
-                        command=self.render).pack(side="left", padx=10)
+                        command=self.on_split).pack(side="left", padx=10)
         b = ttk.Button(top, text="Hold: original")
         b.pack(side="left", padx=4)
         b.bind("<ButtonPress-1>", lambda e: self.set_compare(True))
@@ -1662,7 +1661,7 @@ class App(tk.Tk):
                     self.redo_stack.clear()
                     if res.shape[:2] != self.current.shape[:2]:
                         self.pts, self.cands = [], []
-                        self.current = res
+                        self.current, self.preview = res, None
                         self.fit()
                     self.current, self.preview = res, None
                     if replace is not None:
@@ -1759,34 +1758,70 @@ class App(tk.Tk):
         self.render()
 
     # ---- view ------------------------------------------------------------
+    # Main view = self.zoom / self.off (the edited image, or the only image).
+    # When split view is on and the original has a different size than the edit, the original gets its
+    # own view (self.zoom_o / self.off_o): the left pane shows the original, the right pane the edit, and
+    # each one is zoomed / panned independently by whichever pane the mouse is over.
     def shown(self):
         if self.compare:
             return self.original
+        return self._ref()
+
+    def _ref(self):
         return self.preview if self.preview is not None else self.current
 
-    def fit(self):
-        if self.current is None:
+    def _diff(self):
+        """Split view with an edit whose size differs from the original -> independent views."""
+        ref = self._ref()
+        return (self.split_on.get() and self.original is not None and ref is not None
+                and ref.shape[:2] != self.original.shape[:2])
+
+    def _side(self, x):
+        return "o" if self._diff() and x < int(self.split_pos * self.canvas.winfo_width()) else "e"
+
+    def _view(self, side):
+        return (self.zoom_o, self.off_o) if side == "o" else (self.zoom, self.off)
+
+    def _set_view(self, side, z, off):
+        if side == "o":
+            self.zoom_o, self.off_o = z, off
+        else:
+            self.zoom, self.off = z, off
+
+    def _place(self, side, img, x0, x1, ch, z=None):
+        """Centre `img` inside the canvas columns [x0, x1) (fit to the pane unless z is given)."""
+        h, w = img.shape[:2]
+        z = min((x1 - x0) / w, ch / h) * 0.97 if z is None else z
+        self._set_view(side, z, [x0 + ((x1 - x0) - w * z) / 2, (ch - h * z) / 2])
+
+    def on_split(self):
+        if self._diff():
+            self.fit()
+        else:
+            self.render()
+
+    def fit(self, zoom=None):
+        ref = self._ref()
+        if ref is None:
             return
         cw, ch = max(self.canvas.winfo_width(), 50), max(self.canvas.winfo_height(), 50)
-        h, w = self.current.shape[:2]
-        self.zoom = min(cw / w, ch / h) * 0.97
-        self.off = [(cw - w * self.zoom) / 2, (ch - h * self.zoom) / 2]
+        if self._diff():
+            sx = int(self.split_pos * cw)
+            self._place("o", self.original, 0, sx, ch, zoom)
+            self._place("e", ref, sx, cw, ch, zoom)
+        else:
+            self._place("e", ref, 0, cw, ch, zoom)
         self.render()
 
     def one_to_one(self):
-        if self.current is None:
-            return
-        cw, ch = self.canvas.winfo_width(), self.canvas.winfo_height()
-        h, w = self.current.shape[:2]
-        self.zoom = 1.0
-        self.off = [(cw - w) / 2, (ch - h) / 2]
-        self.render()
+        self.fit(zoom=1.0)
 
     def _zoom_at(self, mx, my, f):
-        z = min(max(self.zoom * f, 0.02), 40.0)
-        f = z / self.zoom
-        self.off = [mx - (mx - self.off[0]) * f, my - (my - self.off[1]) * f]
-        self.zoom = z
+        side = self._side(mx)
+        z0, off0 = self._view(side)
+        z = min(max(z0 * f, 0.02), 40.0)
+        f = z / z0
+        self._set_view(side, z, [mx - (mx - off0[0]) * f, my - (my - off0[1]) * f])
         self.render()
 
     def _to_img(self, x, y):
@@ -1795,9 +1830,10 @@ class App(tk.Tk):
     def _to_cv(self, p):
         return p[0] * self.zoom + self.off[0], p[1] * self.zoom + self.off[1]
 
-    def _canvas_img(self, img, cw, ch):
-        """Draw `img` (zoomed/panned) onto a cw x ch BGR array."""
-        z = self.zoom
+    def _canvas_img(self, img, cw, ch, z=None, off=None):
+        """Draw `img` at zoom z / offset off (default: the main view) onto a cw x ch BGR array."""
+        z = self.zoom if z is None else z
+        off = self.off if off is None else off
         if z < 1:
             ent = self._cache.get(id(img))
             if ent is None or ent[0] is not img or ent[1] != z:
@@ -1805,29 +1841,51 @@ class App(tk.Tk):
                     self._cache.clear()
                 ent = (img, z, cv2.resize(img, None, fx=z, fy=z, interpolation=cv2.INTER_AREA))
                 self._cache[id(img)] = ent
-            src, M, fl = ent[2], np.float32([[1, 0, self.off[0]], [0, 1, self.off[1]]]), cv2.INTER_LINEAR
+            src, M, fl = ent[2], np.float32([[1, 0, off[0]], [0, 1, off[1]]]), cv2.INTER_LINEAR
         else:
-            src, M = img, np.float32([[z, 0, self.off[0]], [0, z, self.off[1]]])
+            src, M = img, np.float32([[z, 0, off[0]], [0, z, off[1]]])
             fl = cv2.INTER_NEAREST if z >= 4 else cv2.INTER_LINEAR
         return cv2.warpAffine(src, M, (cw, ch), flags=fl, borderMode=cv2.BORDER_CONSTANT, borderValue=(40, 40, 40))
 
+    def _view_for(self, ref, other, cw, ch):
+        """Same-centre, undistorted view of `other` matching the main view of `ref` (hold-to-compare
+        without split view, when the edit has a different size than the original)."""
+        if other.shape[:2] == ref.shape[:2]:
+            return self.zoom, self.off
+        fit = lambda a: min(cw / a.shape[1], ch / a.shape[0]) * 0.97
+        z = self.zoom * fit(other) / fit(ref)
+        cx = self.off[0] + ref.shape[1] * self.zoom / 2
+        cy = self.off[1] + ref.shape[0] * self.zoom / 2
+        return z, [cx - other.shape[1] * z / 2, cy - other.shape[0] * z / 2]
+
     def render(self):
-        img = self.shown()
+        ref = self._ref()
         c = self.canvas
         cw, ch = c.winfo_width(), c.winfo_height()
-        if img is None or cw < 2 or ch < 2:
+        if ref is None or cw < 2 or ch < 2:
             return
-        out = self._canvas_img(img, cw, ch)
-        split = self.split_on.get() and not self.compare and self.original is not None
+        key = (ref.shape[:2], self.original.shape[:2] if self.original is not None else None)
+        if self._viewkey is not None and key != self._viewkey:  # image size changed (edit, undo, preview...)
+            self._viewkey = key
+            self.fit()
+            return
+        self._viewkey = key
+        diff = self._diff()
         sx = int(self.split_pos * cw)
-        if split:
-            orig = self.original
-            if orig.shape[:2] != img.shape[:2]:  # edited image has another size: align original to it
-                if self._orig_r is None or self._orig_r[0] != img.shape[:2] or self._orig_r[2] is not orig:
-                    self._orig_r = (img.shape[:2],
-                                    cv2.resize(orig, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_CUBIC), orig)
-                orig = self._orig_r[1]
-            out[:, :sx] = self._canvas_img(orig, cw, ch)[:, :sx]
+        split = self.split_on.get() and not self.compare and self.original is not None
+        if self.compare and self.original is not None:  # hold-to-compare: whole canvas shows the original
+            if diff:
+                out = self._canvas_img(self.original, cw, ch, self.zoom_o, self.off_o)
+            else:
+                z, off = self._view_for(ref, self.original, cw, ch)
+                out = self._canvas_img(self.original, cw, ch, z, off)
+        else:
+            out = self._canvas_img(ref, cw, ch)
+            if split:
+                if diff:
+                    out[:, :sx] = self._canvas_img(self.original, cw, ch, self.zoom_o, self.off_o)[:, :sx]
+                else:
+                    out[:, :sx] = self._canvas_img(self.original, cw, ch)[:, :sx]
         rgb = cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
         self._photo = tk.PhotoImage(width=cw, height=ch, data=f"P6 {cw} {ch} 255 ".encode() + rgb.tobytes(), format="PPM")
         c.delete("all")
@@ -1857,10 +1915,11 @@ class App(tk.Tk):
     def _press(self, e):
         if self.current is None:
             return
+        self._pan = None
         if self._near_split(e.x):
             self._drag_split = True
             return
-        if self.persp.pick.get():
+        if self.persp.pick.get() and self._side(e.x) == "e":  # corners belong to the edited image
             for i, p in enumerate(self.pts):
                 x, y = self._to_cv(p)
                 if (x - e.x) ** 2 + (y - e.y) ** 2 < 15 ** 2:
@@ -1870,7 +1929,7 @@ class App(tk.Tk):
                 self.pts.append(self._to_img(e.x, e.y))
                 self._drag_idx = len(self.pts) - 1
                 self.render()
-        else:
+        elif not self.persp.pick.get() or self._diff():
             self._pan_start(e)
 
     def _drag(self, e):
@@ -1882,30 +1941,37 @@ class App(tk.Tk):
             x, y = self._to_img(e.x, e.y)
             self.pts[self._drag_idx] = [min(max(x, 0), w - 1), min(max(y, 0), h - 1)]
             self.render()
-        elif not self.persp.pick.get():
+        elif self._pan:
             self._pan_move(e)
 
     def _release(self, e):
-        self._drag_idx, self._drag_split = None, False
+        self._drag_idx, self._drag_split, self._pan = None, False, None
 
     def _pan_start(self, e):
-        self._pan = (e.x, e.y, self.off[0], self.off[1])
+        side = self._side(e.x)
+        off = self._view(side)[1]
+        self._pan = (e.x, e.y, off[0], off[1], side)
 
     def _pan_move(self, e):
         if self._pan:
-            self.off = [self._pan[2] + e.x - self._pan[0], self._pan[3] + e.y - self._pan[1]]
+            x0, y0, ox, oy, side = self._pan
+            self._set_view(side, self._view(side)[0], [ox + e.x - x0, oy + e.y - y0])
             self.render()
 
     def _motion(self, e):
-        img = self.shown()
-        if img is None:
+        ref = self._ref()
+        if ref is None:
             return
         self.canvas.config(cursor="sb_h_double_arrow" if self._near_split(e.x) else "crosshair")
-        x, y = self._to_img(e.x, e.y)
+        side = self._side(e.x)
+        img = self.original if side == "o" else self.shown()
+        z, off = self._view(side)
+        x, y = (e.x - off[0]) / z, (e.y - off[1]) / z
         xi, yi = int(x), int(y)
         if 0 <= xi < img.shape[1] and 0 <= yi < img.shape[0]:
             b, g, r = img[yi, xi]
-            self.info.set(f"x={xi} y={yi}  RGB=({r},{g},{b})  zoom={self.zoom * 100:.0f}%  size={img.shape[1]}x{img.shape[0]}")
+            self.info.set(f"{'original' if side == 'o' else 'edited'}  x={xi} y={yi}  RGB=({r},{g},{b})  "
+                          f"zoom={z * 100:.0f}%  size={img.shape[1]}x{img.shape[0]}")
 
 
 # ----------------------------------------------------------------------------
@@ -1966,6 +2032,7 @@ def main():
     if not HAVE_TK:
         sys.exit("tkinter is not installed - use CLI mode (input -o output -p pipeline)")
     App(a.input).mainloop()
+
 
 if __name__ == "__main__":
     main()

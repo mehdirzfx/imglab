@@ -48,7 +48,7 @@ python imglab.py photo.jpg  # open a file directly
 
 1. Pick a tab (Edges, Perspective, Plate, Restore, Enhance, Threshold & Morph, Geometry), choose an operation and adjust the sliders.
 2. **Preview** shows the result without keeping it; **Apply** keeps it. Tick *Live preview* to update while you drag sliders.
-3. Tick **Split view** to compare. Drag the white handle left / right. *Hold: original* flips to the untouched image while pressed.
+3. Tick **Split view** to compare. Drag the white handle left / right. *Hold: original* flips to the untouched image while pressed. If an edit changes the image size or shape (perspective, crop, upscale), the two panes get **independent zoom and pan**: the left pane shows the original and the right pane the edit, each fitted to its own pane and zoomed / panned separately by whichever pane the mouse is over (*Fit* and *1:1* reset both). When the sizes match, both sides share one view so they stay pixel-aligned.
 4. **Save** writes PNG / JPEG / BMP / TIFF.
 
 **Straightening a plate:** open the *Perspective* tab → *Auto-detect* (tick the plate-like option for wide shapes; *Next candidate* cycles through other detections) → fix corners by ticking *Pick corners* and dragging the dots → choose *Output shape* (e.g. *Iran plate 4:1*) → Apply. Then try *Restore → Auto deblur* and *Enhance → Unsharp mask*. Or just use the **Plate** tab to do everything at once.
