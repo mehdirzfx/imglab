@@ -3,11 +3,22 @@
 [![CI](https://github.com/mehdirzfx/imglab/actions/workflows/ci.yml/badge.svg)](https://github.com/mehdirzfx/imglab/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/mehdirzfx/imglab)](https://github.com/mehdirzfx/imglab/releases/latest)
 
-A single-file Python toolkit for **finding edges, straightening perspective (license plates, documents, signs) and restoring poor-quality images**. It has a desktop GUI with a live **original | edited split view**, and a command-line mode for scripts and batch jobs.
+**Fix bad photos in one click: straighten license plates, remove checkerboard / pixelation / blur, and find edges.**
+
+imglab is a single-file Python toolkit (OpenCV + Tkinter) with a desktop GUI, a live **original | edited split view**, and a command-line mode for scripts and batch jobs. Not sure what is wrong with an image? **Auto Fix** diagnoses it and applies only the repairs it needs.
+
+[Download](#install) · [Quick start](#gui-quick-start) · [Command line](#command-line) · [Limitations](#limitations)
 
 ![Examples](docs/examples.png)
 
 <sub>Synthetic test images, generated with the program itself. Real photos with real damage will not recover as cleanly — see [Limitations](#limitations).</sub>
+
+## Why imglab
+
+- **Made for hard real-world cases:** plates photographed at an angle, mosaic-censored or checkerboard-patterned images, motion-blurred shots.
+- **Everything is a step in a pipeline.** What you click in the GUI becomes a text recipe you can copy, save as a preset, and run on a whole folder from the command line.
+- **Honest about its limits.** Restoration cannot invent lost detail, and the docs say what works and what does not.
+- **Nothing to prepare.** One file, a few dependencies; OCR engines and AI-upscale models install from inside the app, or use the standalone download.
 
 ## Features
 
@@ -58,10 +69,10 @@ pip install -r requirements.txt
 python imglab.py
 ```
 
-Requirements: Python 3.9+ (developed and tested on 3.12 / Linux), `opencv-python`, `numpy`, and `tkinter` for the GUI.
+Requirements: Python 3.9+ (developed on 3.12 / Linux; CI runs on 3.9 - 3.13), `opencv-python`, `numpy`, and `tkinter` for the GUI.
 On Debian/Ubuntu `tkinter` is a separate package: `sudo apt install python3-tk`. On Windows and macOS (python.org installers) it is included. The command-line mode works without `tkinter`.
 
-> The GUI and CLI were exercised on Linux (including a virtual display). Windows and macOS should work but have not been tested.
+> The GUI was developed and tested on Linux (including a virtual display). CI runs the non-GUI tests on Windows and macOS too, but the GUI itself is less tested there. Please open an issue if something looks wrong.
 
 ## GUI quick start
 
@@ -174,7 +185,7 @@ xvfb-run -a pytest          # Linux: run them under a virtual display
 - **CI** (`.github/workflows/ci.yml`) runs on every push and pull request: lint, the test suite on Linux (Python 3.9 / 3.11 / 3.13, with a virtual display for the GUI tests), Windows and macOS (Python 3.12, GUI tests skipped), and a command-line smoke test.
 - **Releases** (`.github/workflows/release.yml`): bump `__version__` in `imglab.py`, commit, then
   ```bash
-  git tag v1.0.1 && git push origin v1.0.1
+  git tag v1.1.1 && git push origin v1.1.1
   ```
   The workflow checks the tag against `__version__`, builds the Windows and Linux programs with PyInstaller, smoke-tests them, and attaches them with checksums to a GitHub Release. It can also be started by hand from the Actions tab to build without publishing.
 
@@ -188,17 +199,18 @@ Issues and pull requests are welcome. When reporting a problem, please include t
 
 ## License
 
-No licence has been chosen yet. Add a `LICENSE` file (for example MIT) before publishing if you want others to be able to reuse the code.
+[MIT](LICENSE) © 2026 Mehdi Rezaei Far. The OpenCV model files that *Setup…* downloads have their own licences.
 
 <details>
 <summary>خلاصه به فارسی</summary>
 
-**Image Lab** یک ابزار پایتونی تک‌فایل برای پیدا کردن لبه‌ها، اصلاح پرسپکتیو (پلاک، سند، تابلو) و بهبود کیفیت تصویر است؛ با رابط گرافیکی (شامل نمای دوبخشی «اصلی | ویرایش‌شده») و حالت خط فرمان برای پردازش دسته‌ای.
+**imglab** یک ابزار پایتونی تک‌فایل برای پیدا کردن لبه‌ها، اصلاح پرسپکتیو (پلاک، سند، تابلو) و بهبود کیفیت تصویر است؛ با رابط گرافیکی (شامل نمای دوبخشی «اصلی | ویرایش‌شده») و حالت خط فرمان برای پردازش دسته‌ای.
 
 - **اجرا:** `pip install -r requirements.txt` سپس `python imglab.py`
 - **لبه‌یابی:** Canny، Sobel/Scharr، LoG، DoG، کانتور و غیره.
 - **پرسپکتیو:** انتخاب ۴ گوشه با ماوس یا تشخیص خودکار؛ نسبت‌های آماده برای پلاک (ایران ۴:۱)، A4 و کارت.
 - **بازسازی:** حذف الگوی شطرنجی/هافتون، رفع پیکسلی شدن، رفع محوشدگی حرکتی (خودکار)، حذف نویز، بزرگ‌نمایی و بزرگ‌نمایی با هوش مصنوعی.
+- **Auto Fix:** با یک کلیک (یا `--analyze` در خط فرمان) مشکل عکس را تشخیص می‌دهد (موزاییک، شطرنجی، محوشدگی، کجی، نویز، کنتراست کم) و فقط اصلاح‌های لازم را اعمال می‌کند.
 - **حالت پلاک:** همه‌ی مراحل با یک کلیک، به‌علاوه‌ی دکمه‌ی OCR.
 - **نصب از داخل برنامه:** موتور OCR و مدل‌های بزرگ‌نمایی از دکمه‌ی **Setup…** (یا با `python imglab.py --install rapidocr`) نصب می‌شوند؛ لازم نیست چیزی از قبل آماده باشد. برای فارسی در OCR، گزینه‌ی `easyocr` را نصب کنید.
 - **توجه:** بازسازی نمی‌تواند جزئیاتِ ازدست‌رفته را برگرداند؛ نتیجه برای عکس‌های واقعی به شدت خرابی بستگی دارد.
