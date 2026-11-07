@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Image Lab  -  Edge detection / Perspective correction / Restoration
+imglab  -  Edge detection / Perspective correction / Restoration
 ===================================================================
 
 GUI:   python imglab.py [image]
@@ -38,7 +38,7 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 FROZEN = bool(getattr(sys, "frozen", False))  # running as a PyInstaller executable (no pip available)
 APP_DIR = os.path.dirname(sys.executable) if FROZEN else os.path.dirname(os.path.abspath(__file__))
 MODELS_DIR = os.path.join(APP_DIR, "models")
@@ -1251,6 +1251,24 @@ def list_images(folder):
                   if f.lower().endswith(IMG_EXTS) and not os.path.splitext(f)[0].endswith("_out"))
 
 
+def make_comparison(before, after, labels=("Original", "Edited"), height=600):
+    """Side-by-side 'before | after' picture, both scaled to the same height, with captions."""
+    def fit(img):
+        img = ensure_bgr(img)
+        h, w = img.shape[:2]
+        s = height / h
+        return cv2.resize(img, (max(1, round(w * s)), height), interpolation=cv2.INTER_AREA if s < 1 else cv2.INTER_CUBIC)
+    a, b = fit(before), fit(after)
+    gap = 12
+    out = np.full((height, a.shape[1] + gap + b.shape[1], 3), 255, np.uint8)
+    out[:, :a.shape[1]] = a
+    out[:, a.shape[1] + gap:] = b
+    for text, x in ((labels[0], 10), (labels[1], a.shape[1] + gap + 10)):
+        cv2.putText(out, text, (x, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 0), 4, cv2.LINE_AA)
+        cv2.putText(out, text, (x, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2, cv2.LINE_AA)
+    return out
+
+
 def process_file(src, dst, steps):
     imwrite(dst, run_pipeline(imread(src), steps))
 
@@ -1573,7 +1591,7 @@ class SetupDialog(tk.Toplevel):
 class App(tk.Tk):
     def __init__(self, path=None):
         super().__init__()
-        self.title("Image Lab - Edges / Perspective / Restore")
+        self.title("imglab - Edges / Perspective / Restore")
         self.geometry("1355x730")
         self.minsize(900, 560)
         self.original = self.current = self.preview = None
@@ -1602,7 +1620,7 @@ class App(tk.Tk):
     def _build(self):
         top = ttk.Frame(self)
         top.pack(fill="x")
-        for text, cmd in [("Open", self.open), ("Save", self.save), ("Undo", self.undo), ("Redo", self.redo),
+        for text, cmd in [("Open", self.open), ("Save", self.save), ("Save comparison", self.save_comparison), ("Undo", self.undo), ("Redo", self.redo),
                           ("Reset", self.reset), ("Fit", self.fit), ("1:1", self.one_to_one),
                           ("Auto Fix", self.do_autofix), ("OCR", self.do_ocr), ("Copy CLI recipe", self.copy_recipe),
                           ("Setup...", self.open_setup)]:
@@ -1674,7 +1692,7 @@ class App(tk.Tk):
         self._cache.clear()
         self._orig_r = None
         self.pipeline.refresh()
-        self.title(f"Image Lab - {os.path.basename(path)}")
+        self.title(f"imglab - {os.path.basename(path)}")
         self.update_idletasks()
         self.fit()
         self.msg.set(f"Loaded {img.shape[1]}x{img.shape[0]}")
@@ -1688,6 +1706,16 @@ class App(tk.Tk):
         if p:
             imwrite(p, img)
             self.msg.set(f"Saved {p}")
+
+    def save_comparison(self):
+        img = self.preview if self.preview is not None else self.current
+        if img is None or self.original is None:
+            return
+        p = filedialog.asksaveasfilename(defaultextension=".png", initialfile="comparison.png",
+                                         filetypes=[("PNG", "*.png"), ("JPEG", "*.jpg")])
+        if p:
+            imwrite(p, make_comparison(self.original, img))
+            self.msg.set(f"Comparison saved: {p}")
 
     def copy_recipe(self):
         s = recipe_string(self.recipe)
@@ -2137,7 +2165,7 @@ class App(tk.Tk):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Image Lab - edges, perspective, restoration")
+    ap = argparse.ArgumentParser(description="imglab - edges, perspective, restoration")
     ap.add_argument("input", nargs="?", help="input image (or folder for batch)")
     ap.add_argument("-o", "--output", help="output image / folder (enables CLI mode)")
     ap.add_argument("-p", "--pipeline", default="", help='e.g. "perspective:quad=auto;unsharp:amount=1.5"')
@@ -2145,6 +2173,7 @@ def main():
     ap.add_argument("--auto-persp", action="store_true", help="batch: re-detect perspective for every image")
     ap.add_argument("--version", action="version", version=f"imglab {__version__}")
     ap.add_argument("--list", action="store_true", help="list operations and their parameters")
+    ap.add_argument("--compare", action="store_true", help="single image: also write <output>_compare.png (before | after)")
     ap.add_argument("--analyze", action="store_true", help="diagnose the input image and print the suggested pipeline (no output file needed)")
     ap.add_argument("--status", action="store_true", help="show which optional components are installed")
     ap.add_argument("--install", nargs="+", choices=list(COMPONENTS), metavar="NAME",
@@ -2202,6 +2231,10 @@ def main():
             img = run_pipeline(imread(a.input), steps)
             imwrite(a.output, img)
             print(f"Saved {a.output}  ({img.shape[1]}x{img.shape[0]})")
+            if a.compare:
+                cmp_path = os.path.splitext(a.output)[0] + "_compare.png"
+                imwrite(cmp_path, make_comparison(imread(a.input), img))
+                print(f"Saved {cmp_path}")
             return
         except (KeyError, ValueError, OSError, RuntimeError) as e:  # clean message instead of a traceback
             sys.exit(f"error: {e}")

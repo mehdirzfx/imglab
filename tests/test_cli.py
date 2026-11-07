@@ -72,3 +72,9 @@ def test_analyze_prints_a_pipeline(tmp_path, scene):
     cv2.imwrite(str(p), cv2.resize(cv2.resize(scene, (80, 60)), (640, 480), interpolation=cv2.INTER_NEAREST))
     r = subprocess.run([sys.executable, SCRIPT, str(p), "--analyze"], capture_output=True, text=True)
     assert r.returncode == 0 and "Suggested pipeline" in r.stdout and "depixelate" in r.stdout
+
+
+def test_compare_flag_writes_extra_image(tmp_path, scene_file):
+    out = tmp_path / "o.png"
+    r = subprocess.run([sys.executable, SCRIPT, scene_file, "-o", str(out), "-p", "unsharp", "--compare"], capture_output=True, text=True)
+    assert r.returncode == 0 and (tmp_path / "o_compare.png").is_file()

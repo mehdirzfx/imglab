@@ -181,3 +181,10 @@ def test_auto_fix_improves_a_mosaic(scene):
     bad = _mosaic(scene, 8)
     fixed = L.auto_fix(bad)
     assert fixed.shape == bad.shape and mse(fixed, scene[:bad.shape[0], :bad.shape[1]]) < mse(bad, scene[:bad.shape[0], :bad.shape[1]])
+
+
+def test_make_comparison_has_both_halves(scene):
+    after = L.rotate(scene, 90, True)
+    out = L.make_comparison(scene, after, height=200)
+    assert out.shape[0] == 200 and out.dtype == np.uint8
+    assert out.shape[1] == round(scene.shape[1] * 200 / scene.shape[0]) + 12 + round(after.shape[1] * 200 / after.shape[0])

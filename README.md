@@ -31,7 +31,7 @@ imglab is a single-file Python toolkit (OpenCV + Tkinter) with a desktop GUI, a 
 | **Auto Fix** | One click (toolbar *Auto Fix*, or `auto_fix` in a pipeline): diagnoses the image (mosaic, checker pattern, motion blur, tilted page, noise, low contrast, softness) and applies only the matching fixes. Clean images are left untouched. |
 | **Plate mode** | One click: detect → straighten → denoise → deblur → normalise height → local contrast → sharpen, plus an optional **OCR** button. |
 | **Geometry / threshold** | Free-angle rotate, flip, **auto deskew**, adaptive / Otsu binarisation, morphology. |
-| **Workflow** | Split view, hold-to-compare, undo / redo, pipeline editor (reorder, remove, rebuild from the original), JSON presets, **batch folder processing**, "copy CLI recipe". |
+| **Workflow** | Split view, hold-to-compare, **save a before | after comparison picture**, undo / redo, pipeline editor (reorder, remove, rebuild from the original), JSON presets, **batch folder processing**, "copy CLI recipe". |
 | **Setup from inside the app** | OCR engines and AI-upscale models install from a *Setup…* dialog (or one command) — nothing has to be prepared in advance. |
 
 ## Screenshots
@@ -109,6 +109,9 @@ python imglab.py car.jpg -o plate.png -p "perspective:quad=auto,plate=1,aspect=4
 
 # manual corners (x1|y1|x2|y2|x3|y3|x4|y4, any order)
 python imglab.py car.jpg -o out.png -p "perspective:quad=250|200|640|150|660|290|260|340,aspect=4"
+
+# also write a labelled before | after picture (out_compare.png) - handy for sharing
+python imglab.py car.jpg -o out.png -p "perspective:quad=auto,plate=1" --compare
 
 # one-click plate pipeline
 python imglab.py car.jpg -o plate.png -p "plate_enhance"

@@ -167,3 +167,10 @@ def test_auto_fix_button_repairs_a_mosaic(app):
     pump(app, 0.3)
     assert app.recipe[-1][0] == "depixelate" and "pixelated" in app.msg.get()
     assert (app.current != before).any()
+
+
+def test_save_comparison_writes_file(app, tmp_path, monkeypatch):
+    out = tmp_path / "c.png"
+    monkeypatch.setattr(L.filedialog, "asksaveasfilename", lambda **k: str(out))
+    app.save_comparison()
+    assert out.is_file()
