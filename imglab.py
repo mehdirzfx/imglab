@@ -38,7 +38,7 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 FROZEN = bool(getattr(sys, "frozen", False))  # running as a PyInstaller executable (no pip available)
 APP_DIR = os.path.dirname(sys.executable) if FROZEN else os.path.dirname(os.path.abspath(__file__))
 MODELS_DIR = os.path.join(APP_DIR, "models")
@@ -748,6 +748,82 @@ def estimate_skew(img, max_angle=15.0, refine=2):
 def deskew(img, max_angle, expand):
     angle = estimate_skew(img, max_angle)
     return img if angle is None else rotate(img, angle, expand)
+
+
+# ----------------------------------------------------------------------------
+# AUTO FIX - look at the image, find out what is wrong with it, build the pipeline
+# ----------------------------------------------------------------------------
+
+
+def _noise_sigma(img):
+    """Immerkaer's fast noise estimate (std-dev in grey levels)."""
+    g = to_gray(img).astype(np.float32)
+    h, w = g.shape
+    if h < 8 or w < 8:
+        return 0.0
+    k = np.float32([[1, -2, 1], [-2, 4, -2], [1, -2, 1]])
+    return float(np.abs(cv2.filter2D(g, -1, k)[1:-1, 1:-1]).sum() * np.sqrt(np.pi / 2) / (6.0 * (w - 2) * (h - 2)))
+
+
+def _periodic_peaks(img, sensitivity=8.0, protect=6):
+    """Number of strong isolated spectrum peaks (checker / halftone / moire patterns)."""
+    g = to_gray(img)
+    h, w = g.shape
+    H, W = cv2.getOptimalDFTSize(h), cv2.getOptimalDFTSize(w)
+    f = cv2.copyMakeBorder(g, 0, H - h, 0, W - w, cv2.BORDER_REFLECT).astype(np.float32)
+    mag = np.log1p(np.abs(np.fft.fftshift(np.fft.fft2(f))))
+    res = mag - cv2.GaussianBlur(mag, (0, 0), max(2.0, min(H, W) / 100))
+    med = np.median(res)
+    mad = np.median(np.abs(res - med)) * 1.4826 + 1e-6
+    mask = (res - med) > sensitivity * mad
+    yy, xx = np.ogrid[:H, :W]
+    mask &= ((yy - H // 2) ** 2 + (xx - W // 2) ** 2) > protect ** 2
+    return int(cv2.connectedComponents(mask.astype(np.uint8))[0] - 1)
+
+
+def analyze(img):
+    """Diagnose `img`. Returns (findings, steps): readable problems and the pipeline that fixes them."""
+    findings, steps = [], []
+    img = ensure_bgr(img)
+    b = detect_block_size(img)
+    periodic = False
+    if 1 < b <= 4 and _periodic_peaks(img) >= 4:  # tiny "blocks" are really a fine checker pattern
+        b, periodic = 1, True
+        findings.append("regular checker / halftone / moire pattern")
+        steps.append(("dechecker", {}))
+    elif b > 1:
+        findings.append(f"pixelated / mosaic image (blocks of {b} px)")
+        steps.append(("depixelate", {"block": str(b), "sharpen": "0.4"}))
+    elif _periodic_peaks(img) >= 4:
+        periodic = True
+        findings.append("regular checker / halftone / moire pattern")
+        steps.append(("dechecker", {}))
+    L, ang, found = estimate_motion_blur(img)
+    if found and b <= 1:
+        findings.append(f"motion blur (about {L} px at {ang:.0f} deg)")
+        steps.append(("auto_deblur", {}))
+    sk = estimate_skew(img, 10.0) if float(np.median(to_gray(img))) >= 170 else None  # only paper-like pages
+    if sk is not None and abs(sk) >= 0.7:
+        findings.append(f"tilted by about {abs(sk):.1f} deg")
+        steps.append(("deskew", {"max_angle": "10"}))
+    sigma = _noise_sigma(img)
+    if sigma > 6.0 and b <= 1 and not periodic:
+        findings.append(f"noise (sigma about {sigma:.0f})")
+        steps.append(("denoise_nlm", {}))
+    g = to_gray(img)
+    lo, hi = np.percentile(g, (1, 99))
+    if hi - lo < 150:
+        findings.append(f"low contrast (usable range {int(lo)}..{int(hi)})")
+        steps.append(("auto_levels", {}))
+    if not found and b <= 1 and not periodic and sigma <= 6.0 and float(cv2.Laplacian(g, cv2.CV_64F).var()) < 60.0:
+        findings.append("soft / slightly out of focus")
+        steps.append(("unsharp", {"amount": "1.5"}))
+    return findings, steps
+
+
+@register("auto_fix", "Restore", "Auto fix (diagnose + repair)", "Looks at the image, detects mosaic / checker pattern, motion blur, tilt, noise, low contrast or softness and applies the matching fixes. See what it found with: imglab photo.jpg --analyze", [])
+def auto_fix(img):
+    return run_pipeline(img, analyze(img)[1])
 
 
 # ----------------------------------------------------------------------------
@@ -1528,7 +1604,7 @@ class App(tk.Tk):
         top.pack(fill="x")
         for text, cmd in [("Open", self.open), ("Save", self.save), ("Undo", self.undo), ("Redo", self.redo),
                           ("Reset", self.reset), ("Fit", self.fit), ("1:1", self.one_to_one),
-                          ("OCR", self.do_ocr), ("Copy CLI recipe", self.copy_recipe),
+                          ("Auto Fix", self.do_autofix), ("OCR", self.do_ocr), ("Copy CLI recipe", self.copy_recipe),
                           ("Setup...", self.open_setup)]:
             ttk.Button(top, text=text, command=cmd).pack(side="left", padx=2, pady=4)
         ttk.Checkbutton(top, text="Split view (original | edited)", variable=self.split_on,
@@ -1628,6 +1704,19 @@ class App(tk.Tk):
         except tk.TclError:
             pass
         self._setup = SetupDialog(self)
+
+    def do_autofix(self):
+        img = self.current
+        if img is None:
+            return
+        self.msg.set("Auto fix: analysing the image ...")
+
+        def work():
+            try:
+                self.aux_q.put(("autofix", analyze(img), None))
+            except Exception as e:  # noqa
+                self.aux_q.put(("autofix", None, str(e)))
+        threading.Thread(target=work, daemon=True).start()
 
     def do_ocr(self):
         img = self.preview if self.preview is not None else self.current
@@ -1748,6 +1837,16 @@ class App(tk.Tk):
                         self.clipboard_append(text)
                         self.msg.set(f"OCR: {text}  (copied)")
                         messagebox.showinfo("OCR result", text or "(nothing recognised)")
+                elif item[0] == "autofix":
+                    _, res, err = item
+                    if err:
+                        self.msg.set("Auto fix failed: " + err)
+                    elif not res[1]:
+                        self.msg.set("Auto fix: nothing wrong found - image left unchanged")
+                    else:
+                        findings, steps = res
+                        self.run(lambda: run_pipeline(self.current, steps), True, "Auto fix: " + "; ".join(findings),
+                                 None, list(self.recipe) + steps)
                 elif item[0] == "batch" and self._batch:
                     _, i, n, f, err = item
                     self._batch[1]["value"] = i
@@ -2046,6 +2145,7 @@ def main():
     ap.add_argument("--auto-persp", action="store_true", help="batch: re-detect perspective for every image")
     ap.add_argument("--version", action="version", version=f"imglab {__version__}")
     ap.add_argument("--list", action="store_true", help="list operations and their parameters")
+    ap.add_argument("--analyze", action="store_true", help="diagnose the input image and print the suggested pipeline (no output file needed)")
     ap.add_argument("--status", action="store_true", help="show which optional components are installed")
     ap.add_argument("--install", nargs="+", choices=list(COMPONENTS), metavar="NAME",
                     help="install optional components: " + ", ".join(COMPONENTS))
@@ -2070,6 +2170,17 @@ def main():
             for p in op.params:
                 extra = f" choices={list(p.choices)}" if p.choices else (f" range={p.lo}..{p.hi}" if p.kind in ("int", "float") else "")
                 print(f"    {p.key} ({p.kind}, default={p.default}){extra}")
+        return
+    if a.analyze:
+        if not a.input or os.path.isdir(a.input):
+            sys.exit("error: --analyze needs one input image")
+        try:
+            findings, steps = analyze(imread(a.input))
+        except (ValueError, OSError, RuntimeError) as e:
+            sys.exit(f"error: {e}")
+        print("\n".join(f"- {f}" for f in findings) if findings else "Nothing wrong found.")
+        if steps:
+            print("\nSuggested pipeline (use with -p):\n  " + recipe_string(steps))
         return
     if a.input and a.output:
         try:

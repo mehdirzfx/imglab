@@ -65,3 +65,10 @@ def test_imports_without_tkinter():
     r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60)
     assert r.returncode == 0, r.stderr
     assert r.stdout.strip() == "False"
+
+
+def test_analyze_prints_a_pipeline(tmp_path, scene):
+    p = tmp_path / "t.png"
+    cv2.imwrite(str(p), cv2.resize(cv2.resize(scene, (80, 60)), (640, 480), interpolation=cv2.INTER_NEAREST))
+    r = subprocess.run([sys.executable, SCRIPT, str(p), "--analyze"], capture_output=True, text=True)
+    assert r.returncode == 0 and "Suggested pipeline" in r.stdout and "depixelate" in r.stdout

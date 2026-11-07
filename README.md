@@ -17,6 +17,7 @@ A single-file Python toolkit for **finding edges, straightening perspective (lic
 | **Perspective correction** | Click 4 corners (draggable) or **auto-detect** the quadrilateral, with a "plate-like" filter and a candidate cycler. Output presets: Iran/EU/US plate, A4, ID card, square, or any custom aspect ratio. |
 | **Restoration** | De-pixelate / de-mosaic (block size detected automatically), checkerboard / halftone / moiré removal (FFT notch filter), **auto deblur** (estimates motion-blur length and angle), Wiener and Richardson–Lucy deconvolution, NL-means / bilateral / median denoise, upscale (smart multi-step, Lanczos, cubic) and optional neural **AI upscale** (EDSR, ESPCN, FSRCNN, LapSRN). |
 | **Enhance** | Unsharp mask, CLAHE, auto levels (optionally per channel to fix colour casts), gamma, brightness / contrast, grayscale, invert. |
+| **Auto Fix** | One click (toolbar *Auto Fix*, or `auto_fix` in a pipeline): diagnoses the image (mosaic, checker pattern, motion blur, tilted page, noise, low contrast, softness) and applies only the matching fixes. Clean images are left untouched. |
 | **Plate mode** | One click: detect → straighten → denoise → deblur → normalise height → local contrast → sharpen, plus an optional **OCR** button. |
 | **Geometry / threshold** | Free-angle rotate, flip, **auto deskew**, adaptive / Otsu binarisation, morphology. |
 | **Workflow** | Split view, hold-to-compare, undo / redo, pipeline editor (reorder, remove, rebuild from the original), JSON presets, **batch folder processing**, "copy CLI recipe". |
@@ -84,6 +85,13 @@ The **Pipeline** tab lists every applied step. Reorder or remove steps and press
 
 ## Command line
 
+Not sure what is wrong with a picture? Let imglab diagnose it and print a pipeline you can reuse:
+
+```bash
+python imglab.py photo.jpg --analyze
+python imglab.py photo.jpg -o fixed.png -p auto_fix
+```
+
 ```bash
 # one image, steps separated by ';'  (step = name:key=value,key=value)
 python imglab.py car.jpg -o plate.png -p "perspective:quad=auto,plate=1,aspect=4;auto_deblur;unsharp:amount=1.5"
@@ -136,6 +144,7 @@ Notes:
 - Neural **AI upscale** is the only mode that adds plausible new detail, and it is slow on large images.
 - Perspective **auto-detect** looks for a convex four-sided shape with strong edges. It can pick the wrong object in cluttered scenes — use *Next candidate* or place the corners by hand.
 - **Auto deblur** is a heuristic: it detects strong linear motion blur up to about 25 px. Very long blur is missed, and a sharp image with very regular fine structure (for example thin repeated text) can occasionally be mistaken for blur. The *Min. confidence* slider controls how eager it is; use the manual *Deblur* when you know the blur. Auto deskew is typically accurate to well under a degree.
+- **Auto Fix** is conservative and rule-based, so it can miss problems or occasionally misjudge unusual images (it only considers straightening for paper-like pages with a light background). Check the result, or use `--analyze` and adjust the suggested pipeline by hand.
 - **OCR** quality depends on the engine and the plate style; the bundled engines are general-purpose, not plate-specific. Always check the output.
 - Very large images make some operations (NL-means, Wiener on huge frames, AI upscale) slow. Previews run in a background thread, so the window stays responsive.
 

@@ -154,3 +154,16 @@ def test_ocr_without_engine_offers_setup(app, monkeypatch):
     monkeypatch.setattr(L.messagebox, "askyesno", lambda *a, **k: asked.append(a) or True)
     app.do_ocr()
     assert asked and app._setup.winfo_exists()
+
+
+def test_auto_fix_button_repairs_a_mosaic(app):
+    import cv2
+    h, w = app.current.shape[:2]
+    app.current = cv2.resize(cv2.resize(app.current, (w // 8, h // 8), interpolation=cv2.INTER_AREA),
+                             (w // 8 * 8, h // 8 * 8), interpolation=cv2.INTER_NEAREST)
+    before = app.current.copy()
+    app.do_autofix()
+    wait_for(app, lambda: app.recipe)
+    pump(app, 0.3)
+    assert app.recipe[-1][0] == "depixelate" and "pixelated" in app.msg.get()
+    assert (app.current != before).any()

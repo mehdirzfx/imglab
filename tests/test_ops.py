@@ -151,3 +151,33 @@ def test_edge_outputs(scene):
 def test_binarize_gives_two_levels(scene):
     out = L.binarize(scene, "otsu", 31, 10, False)
     assert set(np.unique(out)) <= {0, 255}
+
+
+def _mosaic(img, b):
+    h, w = img.shape[:2]
+    small = cv2.resize(img, (w // b, h // b), interpolation=cv2.INTER_AREA)
+    return cv2.resize(small, (w // b * b, h // b * b), interpolation=cv2.INTER_NEAREST)
+
+
+def test_analyze_leaves_clean_images_alone(scene, text_img):
+    for img in (scene, text_img):
+        findings, steps = L.analyze(img)
+        assert findings == [] and steps == []
+        assert np.array_equal(L.auto_fix(img), img)
+
+
+def test_analyze_finds_mosaic_blur_tilt_noise(scene, text_img):
+    f, s = L.analyze(_mosaic(scene, 8))
+    assert [n for n, _ in s][:1] == ["depixelate"] and s[0][1]["block"] == "8"
+    k = np.zeros((9, 9), np.float32)
+    k[4, :] = 1 / 9
+    assert "auto_deblur" in [n for n, _ in L.analyze(cv2.filter2D(text_img, -1, k))[1]]
+    assert "deskew" in [n for n, _ in L.analyze(L.rotate(text_img, 5, True))[1]]
+    noisy = np.clip(scene + np.random.default_rng(0).normal(0, 15, scene.shape), 0, 255).astype(np.uint8)
+    assert "denoise_nlm" in [n for n, _ in L.analyze(noisy)[1]]
+
+
+def test_auto_fix_improves_a_mosaic(scene):
+    bad = _mosaic(scene, 8)
+    fixed = L.auto_fix(bad)
+    assert fixed.shape == bad.shape and mse(fixed, scene[:bad.shape[0], :bad.shape[1]]) < mse(bad, scene[:bad.shape[0], :bad.shape[1]])
