@@ -174,3 +174,62 @@ def test_save_comparison_writes_file(app, tmp_path, monkeypatch):
     monkeypatch.setattr(L.filedialog, "asksaveasfilename", lambda **k: str(out))
     app.save_comparison()
     assert out.is_file()
+
+
+# ---------------------------------------------------------------- histogram panel
+def test_histogram_panel_toggles_and_tracks_the_image(app):
+    assert not app.hist.winfo_ismapped()
+    app.hist_on.set(True)
+    app.toggle_hist()
+    pump(app, 0.3)
+    assert app.hist.winfo_ismapped() and app.hist.cur is not None
+    assert app.hist.cur[3].sum() == app.current.shape[0] * app.current.shape[1]
+    assert "mean" in app.hist.stats.get()
+    assert app.hist.cv.find_all()  # something is drawn
+    before = app.hist.cur
+    app._zoom_at(200, 200, 1.5)  # panning / zooming must not recompute
+    assert app.hist.cur is before
+    app.hist_on.set(False)
+    app.toggle_hist()
+    assert not app.hist.winfo_ismapped()
+
+
+def test_histogram_follows_a_levels_preview_and_apply(app):
+    app.hist_on.set(True)
+    app.toggle_hist()
+    pump(app, 0.2)
+    base_mean = app.hist.stats.get()
+    panel = app.panels["Enhance"]
+    panel.op_var.set("Levels (black / white point, gamma)")
+    panel.rebuild()
+    panel.vars["gamma"].set(2.5)
+    panel.go(False)
+    wait_for(app, lambda: app.preview is not None)
+    pump(app, 0.2)
+    assert app.hist.stats.get() != base_mean
+    assert app.hist.orig is not None  # the original stays available for the dashed overlay
+    panel.go(True)
+    wait_for(app, lambda: app.recipe)
+    assert app.recipe[-1][0] == "levels"
+    for mode in app.hist.MODES:  # every channel view renders without errors
+        app.hist.mode.set(mode)
+        app.hist.redraw()
+    app.hist.log.set(True)
+    app.hist.redraw()
+
+
+def test_ctrl_h_toggles_histogram(app):
+    app.event_generate("<Control-h>")
+    pump(app, 0.2)
+    assert app.hist_on.get() and app.hist.winfo_ismapped()
+
+
+def test_new_restore_ops_appear_in_the_gui(app):
+    labels = {o.label for o in app.panels["Restore"].ops}
+    assert {"Remove haze / fog (dark channel)", "Remove JPEG blocking", "Brighten dark / night photo"} <= labels
+    p = app.panels["Restore"]
+    p.op_var.set("Remove JPEG blocking")
+    p.rebuild()
+    p.go(True)
+    wait_for(app, lambda: app.recipe)
+    assert app.recipe[-1][0] == "deblock"

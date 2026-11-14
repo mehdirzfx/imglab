@@ -38,7 +38,7 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
-__version__ = "1.1.1"
+__version__ = "1.2.0"
 FROZEN = bool(getattr(sys, "frozen", False))  # running as a PyInstaller executable (no pip available)
 APP_DIR = os.path.dirname(sys.executable) if FROZEN else os.path.dirname(os.path.abspath(__file__))
 MODELS_DIR = os.path.join(APP_DIR, "models")
@@ -341,6 +341,74 @@ def auto_levels(img, low_pct, high_pct, per_channel):
     return np.clip(out, 0, 255)
 
 
+@register("levels", "Enhance", "Levels (black / white point, gamma)",
+          "Photoshop-style levels. Turn on the Histogram (toolbar or Ctrl+H) and drag the sliders until the histogram fills the range.", [
+    P("channel", "Channel", "choice", "all", choices=("all", "red", "green", "blue")),
+    P("in_black", "Input black", "int", 0, 0, 254, 1),
+    P("in_white", "Input white", "int", 255, 1, 255, 1),
+    P("gamma", "Gamma (midtones, >1 brightens)", "float", 1.0, 0.1, 5.0, 0.01),
+    P("out_black", "Output black", "int", 0, 0, 254, 1),
+    P("out_white", "Output white", "int", 255, 1, 255, 1),
+])
+def levels(img, channel, in_black, in_white, gamma, out_black, out_white):
+    ib = int(in_black)
+    iw = max(int(in_white), ib + 1)
+    ob = int(out_black)
+    ow = max(int(out_white), ob + 1)
+    t = np.clip((np.arange(256, dtype=np.float32) - ib) / (iw - ib), 0.0, 1.0) ** (1.0 / max(gamma, 0.01))
+    lut = np.clip(np.round(ob + t * (ow - ob)), 0, 255).astype(np.uint8)
+    if channel == "all":
+        return cv2.LUT(img, lut)
+    out = img.copy()
+    i = {"blue": 0, "green": 1, "red": 2}[channel]
+    out[..., i] = cv2.LUT(img[..., i], lut)
+    return out
+
+
+@register("equalize", "Enhance", "Histogram equalization",
+          "Spreads the brightness values evenly over the whole range (global). Strong on flat, hazy or dark pictures; use CLAHE for a gentler local version.", [
+    P("mode", "Applies to", "choice", "luminance", choices=("luminance", "per_channel")),
+    P("strength", "Strength", "float", 1.0, 0.0, 1.0, 0.05),
+])
+def equalize(img, mode, strength):
+    if strength <= 0:
+        return img
+    if mode == "per_channel":
+        eq = cv2.merge([cv2.equalizeHist(c) for c in cv2.split(img)])
+    else:
+        ycc = cv2.cvtColor(img, cv2.COLOR_BGR2YCrCb)
+        ycc[..., 0] = cv2.equalizeHist(ycc[..., 0])
+        eq = cv2.cvtColor(ycc, cv2.COLOR_YCrCb2BGR)
+    return cv2.addWeighted(img, 1.0 - strength, eq, strength, 0)
+
+
+def _match_channel(src, ref):
+    def cdf(a):
+        c = np.cumsum(np.bincount(a.ravel(), minlength=256).astype(np.float64))
+        return c / c[-1]
+    lut = np.interp(cdf(src), cdf(ref), np.arange(256))
+    return cv2.LUT(src, np.clip(np.round(lut), 0, 255).astype(np.uint8))
+
+
+@register("match_histogram", "Enhance", "Match histogram to a reference photo",
+          "Gives this picture the brightness / colour distribution of a good reference photo (same scene or camera). Leave the reference empty for no change.", [
+    P("reference", "Reference image", "str", ""),
+    P("color", "Match colours (off = brightness only)", "bool", True),
+    P("strength", "Strength", "float", 1.0, 0.0, 1.0, 0.05),
+])
+def match_histogram(img, reference, color, strength):
+    if not str(reference).strip() or strength <= 0:
+        return img
+    ref = imread(str(reference).strip())
+    if color:
+        out = cv2.merge([_match_channel(a, b) for a, b in zip(cv2.split(img), cv2.split(ref))])
+    else:
+        a, b = cv2.cvtColor(img, cv2.COLOR_BGR2YCrCb), cv2.cvtColor(ref, cv2.COLOR_BGR2YCrCb)
+        a[..., 0] = _match_channel(a[..., 0], b[..., 0])
+        out = cv2.cvtColor(a, cv2.COLOR_YCrCb2BGR)
+    return cv2.addWeighted(img, 1.0 - strength, out, strength, 0)
+
+
 @register("gamma", "Enhance", "Gamma", "Gamma > 1 brightens shadows.", [
     P("gamma", "Gamma", "float", 1.3, 0.2, 4.0, 0.05),
 ])
@@ -481,6 +549,157 @@ def dechecker(img, sensitivity, radius, protect, strength):
     return np.clip(out[:h, :w], 0, 255)
 
 
+def _guided_filter(guide, src, radius, eps):
+    """Edge-preserving guided filter (He et al.) on float32 single-channel arrays; cost does not depend on radius."""
+    k = (2 * int(radius) + 1,) * 2
+
+    def mean(a):
+        return cv2.boxFilter(a, -1, k, borderType=cv2.BORDER_REFLECT)
+    mg, ms = mean(guide), mean(src)
+    a = (mean(guide * src) - mg * ms) / (mean(guide * guide) - mg * mg + eps)
+    b = ms - a * mg
+    return mean(a) * guide + mean(b)
+
+
+@register("dehaze", "Restore", "Remove haze / fog (dark channel)",
+          "Dark-channel-prior dehazing for foggy, smoggy or washed-out outdoor shots. Not for flat documents (a white page looks like haze).", [
+    P("strength", "Strength", "float", 0.75, 0.0, 1.0, 0.01),
+    P("patch", "Patch size (odd)", "int", 15, 3, 51, 2),
+    P("min_t", "Min transmission (higher = safer)", "float", 0.15, 0.05, 0.6, 0.01),
+])
+def dehaze(img, strength, patch, min_t):
+    f = img.astype(np.float32) / 255.0
+    k = cv2.getStructuringElement(cv2.MORPH_RECT, (odd(patch), odd(patch)))
+    dark = cv2.erode(f.min(axis=2), k)
+    n = max(1, int(dark.size * 0.001))  # atmospheric light = brightest pixel among the haziest 0.1 %
+    idx = np.argpartition(dark.ravel(), -n)[-n:]
+    cand = f.reshape(-1, 3)[idx]
+    A = np.maximum(cand[np.argmax(cand.sum(axis=1))], 0.2)
+    t = 1.0 - strength * cv2.erode((f / A).min(axis=2), k)
+    t = _guided_filter(to_gray(img).astype(np.float32) / 255.0, t.astype(np.float32), max(8, 4 * int(patch)), 1e-3)
+    t = np.clip(t, min_t, 1.0)[..., None]
+    return np.clip(((f - A) / t + A) * 255.0, 0, 255)
+
+
+@register("low_light", "Restore", "Brighten dark / night photo",
+          "Lifts shadows by estimating the lighting (Retinex / LIME style) and dividing it out; leaves bright areas alone. Denoise first because brightening amplifies noise.", [
+    P("strength", "Strength", "float", 0.7, 0.0, 1.0, 0.05),
+    P("denoise", "Denoise before (0 = off, slow)", "float", 0.0, 0.0, 15.0, 0.5),
+    P("max_gain", "Max brightening (x)", "float", 6.0, 1.0, 16.0, 0.5),
+])
+def low_light(img, strength, denoise, max_gain):
+    src = cv2.fastNlMeansDenoisingColored(img, None, denoise, denoise, 7, 21) if denoise > 0 else img
+    f = src.astype(np.float32) / 255.0
+    m = f.max(axis=2)
+    r = max(8, min(m.shape) // 40)
+    illum = np.clip(_guided_filter(m, m, r, 1e-2), 1e-3, 1.0)
+    gain = np.minimum(illum ** -strength, max_gain)[..., None]
+    return np.clip(f * gain * 255.0, 0, 255)
+
+
+@register("flatten_light", "Restore", "Even out lighting / remove shadows",
+          "Estimates the uneven background light and divides it out. 'document' keeps dark text on a light page (plates, signs, scans); 'retinex' evens out a general photo.", [
+    P("method", "Method", "choice", "document", choices=("document", "retinex")),
+    P("size", "Feature size (% of image)", "float", 5.0, 1.0, 40.0, 0.5),
+    P("strength", "Strength", "float", 1.0, 0.0, 1.0, 0.05),
+])
+def flatten_light(img, method, size, strength):
+    h, w = img.shape[:2]
+    s = min(1.0, 256.0 / min(h, w))  # the lighting is smooth: estimate it on a small copy
+    small = cv2.resize(img, None, fx=s, fy=s, interpolation=cv2.INTER_AREA) if s < 1 else img
+    k = odd(max(3, size / 100.0 * min(small.shape[:2])))
+    f = small.astype(np.float32)
+    if method == "retinex":
+        bg = cv2.GaussianBlur(f, (0, 0), k)
+    else:
+        bg = cv2.GaussianBlur(cv2.dilate(f, cv2.getStructuringElement(cv2.MORPH_RECT, (k, k))), (0, 0), k / 2.0 + 1)
+    bg = np.maximum(cv2.resize(bg, (w, h), interpolation=cv2.INTER_CUBIC), 1.0)
+    out = img.astype(np.float32) / bg * (float(bg.mean()) if method == "retinex" else 255.0)
+    return np.clip(img * (1.0 - strength) + out * strength, 0, 255)
+
+
+def jpeg_grid(img, grid=8):
+    """Find a JPEG-style blocking grid. Returns (offset_x, offset_y, score): block borders lie between column c-1 and
+    c for every c with c % grid == offset_x (same for rows). The score compares how far the steps on that phase stick
+    out of their neighbours with the other phases - about 0 for an image without blocking, clearly above 1 when blocky."""
+    g = to_gray(img).astype(np.float32)
+    grid = max(2, int(grid))
+
+    def phase(d):
+        if len(d) < 3 * grid:
+            return 0, 0.0
+        ex = np.minimum(np.maximum(d[1:-1] - (d[:-2] + d[2:]) / 2, 0.0), 20.0)  # ex[k] belongs to border c = k + 2
+        e = np.array([ex[(p - 2) % grid::grid].mean() for p in range(grid)])
+        best = int(np.argmax(e))
+        return best, float(e[best] / ((e.sum() - e[best]) / (grid - 1) + 0.05))
+    ox, sx = phase(np.abs(np.diff(g, axis=1)).mean(axis=0))
+    oy, sy = phase(np.abs(np.diff(g, axis=0)).mean(axis=1))
+    return ox, oy, min(sx, sy)
+
+
+def _deblock_cols(f, cols, strength, threshold, width):
+    """Remove the block-border step between columns cols-1 and cols (in place on the float image f).
+
+    Only the part of the step that is larger than the gradient on both sides of the border is treated as a
+    blocking artefact, and steps above `threshold` are real edges and stay untouched. The correction fades out
+    over `width` pixels on each side."""
+    w = f.shape[1]
+    cols = cols[(cols >= 2) & (cols < w - 1)]
+    if not len(cols):
+        return
+    g = f @ np.float32([0.114, 0.587, 0.299])
+    step = np.abs(g[:, cols] - g[:, cols - 1])
+    inner = (np.abs(g[:, cols - 1] - g[:, cols - 2]) + np.abs(g[:, cols + 1] - g[:, cols])) / 2
+    keep = np.clip(1.0 - step / threshold, 0.0, 1.0) * np.maximum(step - inner, 0.0) / np.maximum(step, 1e-3)
+    d = (f[:, cols] - f[:, cols - 1]) * (0.5 * strength * keep)[..., None]
+    for j in range(width):
+        ia, ib = cols - 1 - j, cols + j
+        ok = (ia >= 0) & (ib < w)
+        fall = 1.0 - j / width
+        f[:, ia[ok]] += d[:, ok] * fall
+        f[:, ib[ok]] -= d[:, ok] * fall
+
+
+@register("deblock", "Restore", "Remove JPEG blocking",
+          "Smooths the 8x8 block borders of heavily compressed JPEGs. Only the step that sticks out of the local gradient is removed, so real edges stay sharp. Finds the grid offset automatically (also on cropped images).", [
+    P("grid", "Block size", "int", 8, 4, 32, 1),
+    P("strength", "Strength", "float", 1.0, 0.0, 1.0, 0.05),
+    P("threshold", "Edge protection (steps above this stay)", "float", 40.0, 4.0, 120.0, 1.0),
+    P("width", "Border width (px)", "int", 2, 1, 6, 1),
+    P("auto_grid", "Detect grid offset", "bool", True),
+])
+def deblock(img, grid, strength, threshold, width, auto_grid):
+    grid, width = max(2, int(grid)), max(1, int(width))
+    ox, oy = jpeg_grid(img, grid)[:2] if auto_grid else (0, 0)
+    f = img.astype(np.float32)
+    h, w = f.shape[:2]
+    _deblock_cols(f, np.arange(ox if ox > 0 else grid, w, grid), strength, threshold, width)
+    ft = np.ascontiguousarray(f.transpose(1, 0, 2))  # same filter for the horizontal borders
+    _deblock_cols(ft, np.arange(oy if oy > 0 else grid, h, grid), strength, threshold, width)
+    return np.clip(ft.transpose(1, 0, 2), 0, 255)
+
+
+@register("remove_spots", "Restore", "Remove dust / specks (auto)",
+          "Finds small bright or dark specks (dust, dead pixels, salt-and-pepper blobs) and fills them in from the surroundings. For photos and scans, not for text: thin letter strokes look like specks too.", [
+    P("mode", "Look for", "choice", "both", choices=("both", "bright", "dark")),
+    P("threshold", "Contrast threshold", "int", 30, 5, 120, 1),
+    P("max_size", "Max speck size (px)", "int", 5, 1, 25, 1),
+    P("radius", "Fill radius", "float", 3.0, 1.0, 10.0, 0.5),
+])
+def remove_spots(img, mode, threshold, max_size, radius):
+    g = to_gray(img)
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (odd(max_size) + 2, odd(max_size) + 2))
+    mask = np.zeros(g.shape, bool)
+    if mode in ("both", "bright"):
+        mask |= cv2.morphologyEx(g, cv2.MORPH_TOPHAT, k) > threshold
+    if mode in ("both", "dark"):
+        mask |= cv2.morphologyEx(g, cv2.MORPH_BLACKHAT, k) > threshold
+    if not mask.any() or mask.mean() > 0.2:  # nothing found, or this is texture / text and not specks: leave it alone
+        return img
+    m = cv2.dilate(mask.astype(np.uint8) * 255, np.ones((3, 3), np.uint8))
+    return cv2.inpaint(img, m, float(radius), cv2.INPAINT_TELEA)
+
+
 def _psf(kind, size, angle):
     if kind == "motion":
         L = max(3, int(round(size)) | 1)
@@ -488,6 +707,11 @@ def _psf(kind, size, angle):
         k[L // 2, :] = 1
         M = cv2.getRotationMatrix2D(((L - 1) / 2, (L - 1) / 2), angle, 1.0)
         k = cv2.warpAffine(k, M, (L, L))
+    elif kind == "disk":  # lens defocus: a uniformly lit disc of radius `size`
+        r = max(1.0, float(size))
+        c = int(math.ceil(r)) + 1
+        yy, xx = np.mgrid[-c:c + 1, -c:c + 1]
+        k = np.clip(r + 0.5 - np.hypot(xx, yy), 0.0, 1.0).astype(np.float32)
     else:
         ks = odd(int(6 * size + 1))
         g = cv2.getGaussianKernel(ks, size)
@@ -496,9 +720,9 @@ def _psf(kind, size, angle):
     return k / s if s > 0 else k
 
 
-@register("deblur", "Restore", "Deblur (Wiener deconvolution)", "Fix out-of-focus (gaussian) or motion blur, e.g. blurry plates.", [
-    P("kind", "Blur type", "choice", "motion", choices=("motion", "gaussian")),
-    P("size", "Blur size / length", "float", 5.0, 1.0, 40.0, 0.5),
+@register("deblur", "Restore", "Deblur (Wiener deconvolution)", "Fix out-of-focus (disk = lens defocus, gaussian = soft focus) or motion blur, e.g. blurry plates.", [
+    P("kind", "Blur type", "choice", "motion", choices=("motion", "gaussian", "disk")),
+    P("size", "Blur length / sigma / radius", "float", 5.0, 1.0, 40.0, 0.5),
     P("angle", "Motion angle", "float", 0.0, -90.0, 90.0, 1.0),
     P("noise", "Noise (higher = safer)", "float", 0.01, 0.0005, 0.3, 0.0005),
     P("method", "Method", "choice", "wiener", choices=("wiener", "richardson_lucy")),
@@ -812,7 +1036,10 @@ def analyze(img):
         steps.append(("denoise_nlm", {}))
     g = to_gray(img)
     lo, hi = np.percentile(g, (1, 99))
-    if hi - lo < 150:
+    if float(np.median(g)) < 45 and hi < 150:
+        findings.append(f"dark / under-exposed (median brightness {int(np.median(g))})")
+        steps.append(("low_light", {"denoise": "3"} if sigma > 3.0 else {}))
+    elif hi - lo < 150:
         findings.append(f"low contrast (usable range {int(lo)}..{int(hi)})")
         steps.append(("auto_levels", {}))
     if not found and b <= 1 and not periodic and sigma <= 6.0 and float(cv2.Laplacian(g, cv2.CV_64F).var()) < 60.0:
@@ -970,6 +1197,36 @@ def plate_enhance(img, detect, aspect, height, denoise, fix_blur, contrast, shar
     if sharpen > 0:
         out = ensure_bgr(_unsharp(out, sharpen, 1.2))
     return ensure_bgr(binarize(out, "adaptive_gaussian", 31, 10, False)) if bw else out
+
+
+def image_histograms(img, max_pixels=4_000_000):
+    """Counts of every grey level as a (4, 256) float array: rows are blue, green, red and luma (Rec. 601).
+    Very large images are sampled with a regular stride, which keeps the shape of the histogram."""
+    img = ensure_bgr(img)
+    h, w = img.shape[:2]
+    if h * w > max_pixels:
+        step = int(math.ceil(math.sqrt(h * w / max_pixels)))
+        img = img[::step, ::step]
+    out = np.zeros((4, 256), np.float64)
+    for i in range(3):
+        out[i] = np.bincount(img[..., i].ravel(), minlength=256)
+    out[3] = np.bincount(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).ravel(), minlength=256)
+    return out
+
+
+def histogram_stats(counts):
+    """Summary of one 256-bin histogram: mean, std, median, p1 / p99 (the usable range) and the percentage of
+    pixels clipped to pure black (0) and pure white (255)."""
+    counts = np.asarray(counts, np.float64)
+    n = float(counts.sum())
+    if n <= 0:
+        return dict(mean=0.0, std=0.0, median=0, p1=0, p99=0, black=0.0, white=0.0)
+    v = np.arange(256)
+    mean = float((counts * v).sum() / n)
+    cum = np.cumsum(counts) / n
+    pct = lambda q: int(min(np.searchsorted(cum, q / 100.0), 255))  # noqa: E731
+    return dict(mean=mean, std=float(math.sqrt(((v - mean) ** 2 * counts).sum() / n)), median=pct(50),
+                p1=pct(1), p99=pct(99), black=float(counts[0] / n * 100), white=float(counts[255] / n * 100))
 
 
 # ----------------------------------------------------------------------------
@@ -1334,7 +1591,7 @@ class OpPanel(ttk.Frame):
                 row = ttk.Frame(self.box)
                 row.pack(fill="x", pady=(0, 4))
                 ttk.Entry(row, textvariable=var).pack(side="left", fill="x", expand=True)
-                if p.key == "model":
+                if p.key in ("model", "reference"):
                     ttk.Button(row, text="...", width=3,
                                command=lambda v=var: v.set(filedialog.askopenfilename() or v.get())).pack(side="left", padx=2)
             else:
@@ -1362,6 +1619,87 @@ class OpPanel(ttk.Frame):
         op, vals, src = self.op, self.values(), self.app.current
         self.app.run(lambda: op.func(src.copy(), **vals) if op.name != "grayscale" else op.func(src),
                      commit, op.label, (op.name, vals))
+
+
+class HistPanel(ttk.Frame):
+    """Live histogram under the image: RGB / luma / single channel, linear or log, with the original as dashed overlay."""
+    MODES = ("RGB", "Luma", "Red", "Green", "Blue")
+    HEIGHT = 150
+    COLORS = {"Red": "#ff5a5a", "Green": "#4fd05f", "Blue": "#5b8cff", "Luma": "#d8d8d8"}
+
+    def __init__(self, master, app):
+        super().__init__(master)
+        self.app = app
+        bar = ttk.Frame(self)
+        bar.pack(fill="x")
+        self.mode = tk.StringVar(value="RGB")
+        cb = ttk.Combobox(bar, textvariable=self.mode, values=self.MODES, state="readonly", width=7)
+        cb.pack(side="left", padx=4, pady=2)
+        cb.bind("<<ComboboxSelected>>", lambda e: self.redraw())
+        self.log = tk.BooleanVar(value=False)
+        self.show_orig = tk.BooleanVar(value=True)
+        ttk.Checkbutton(bar, text="Log", variable=self.log, command=self.redraw).pack(side="left")
+        ttk.Checkbutton(bar, text="Original (dashed)", variable=self.show_orig, command=self.redraw).pack(side="left", padx=6)
+        self.stats = tk.StringVar()
+        ttk.Label(bar, textvariable=self.stats).pack(side="right", padx=6)
+        self.cv = tk.Canvas(self, height=self.HEIGHT, bg="#1c1c1c", highlightthickness=0)
+        self.cv.pack(fill="x")
+        self.cv.bind("<Configure>", lambda e: self.redraw())
+        self._src, self._orig_src = None, None
+        self.cur = self.orig = None
+
+    def update_from(self, ref, original):
+        """Recompute only when the shown image (or the original) really changed - panning / zooming is free."""
+        if ref is None:
+            return
+        if self._src is not ref:
+            self._src, self.cur = ref, image_histograms(ref)
+        if original is not None and self._orig_src is not original:
+            self._orig_src, self.orig = original, image_histograms(original)
+        self.redraw()
+
+    def _rows(self):
+        m = self.mode.get()
+        if m == "RGB":
+            return [("Luma", 3, True), ("Blue", 0, False), ("Green", 1, False), ("Red", 2, False)], 3
+        row = {"Luma": 3, "Blue": 0, "Green": 1, "Red": 2}[m]
+        return [(m, row, m == "Luma")], row
+
+    def redraw(self):
+        c = self.cv
+        c.delete("all")
+        if self.cur is None:
+            return
+        w, h = max(c.winfo_width(), 60), max(c.winfo_height(), 30)
+        rows, main = self._rows()
+        fn = np.log1p if self.log.get() else (lambda a: a)
+        overlay = fn(self.orig[main]) if self.orig is not None and self.show_orig.get() else None
+        series = [(name, fn(self.cur[r]), fill) for name, r, fill in rows]
+        top = 0.0
+        for a in [x[1] for x in series] + ([overlay] if overlay is not None else []):
+            top = max(top, float(a[1:255].max()) or float(a.max()))  # ignore the 0 / 255 spikes when scaling
+        top = top or 1.0
+        xs = np.linspace(0, w - 1, 256)
+
+        def pts(a):
+            ys = (h - 3) - np.minimum(a / top, 1.0) * (h - 8)
+            return [v for xy in zip(xs, ys) for v in xy]
+        for x in (64, 128, 192):
+            c.create_line(x * (w - 1) / 255, 0, x * (w - 1) / 255, h, fill="#333333")
+        for name, a, fill in series:
+            if fill:
+                c.create_polygon([0, h] + pts(a) + [w, h], fill="#404040", outline="")
+        for name, a, fill in series:
+            c.create_line(pts(a), fill=self.COLORS[name], width=1)
+        if overlay is not None:
+            c.create_line(pts(overlay), fill="white", dash=(3, 3))
+        st = histogram_stats(self.cur[main])
+        if st["black"] >= 1.0:
+            c.create_rectangle(0, h - 6, 7, h, fill="#ff4040", outline="")
+        if st["white"] >= 1.0:
+            c.create_rectangle(w - 7, h - 6, w, h, fill="#ff4040", outline="")
+        self.stats.set(f"mean {st['mean']:.0f}  std {st['std']:.0f}  range {st['p1']}-{st['p99']}  "
+                       f"clipped {st['black']:.1f}% / {st['white']:.1f}%")
 
 
 class PerspectivePanel(ttk.Frame):
@@ -1611,6 +1949,7 @@ class App(tk.Tk):
         self._drag_idx = None
         self._pan = None
         self._batch = None
+        self.hist_on = tk.BooleanVar(value=False)
         self._build()
         self.after(40, self._poll)
         if path:
@@ -1625,6 +1964,7 @@ class App(tk.Tk):
                           ("Auto Fix", self.do_autofix), ("OCR", self.do_ocr), ("Copy CLI recipe", self.copy_recipe),
                           ("Setup...", self.open_setup)]:
             ttk.Button(top, text=text, command=cmd).pack(side="left", padx=2, pady=4)
+        ttk.Checkbutton(top, text="Histogram", variable=self.hist_on, command=self.toggle_hist).pack(side="left", padx=10)
         ttk.Checkbutton(top, text="Split view (original | edited)", variable=self.split_on,
                         command=self.on_split).pack(side="left", padx=10)
         b = ttk.Button(top, text="Hold: original")
@@ -1634,8 +1974,11 @@ class App(tk.Tk):
 
         pw = ttk.PanedWindow(self, orient="horizontal")
         pw.pack(fill="both", expand=True)
-        self.canvas = tk.Canvas(pw, bg="#282828", highlightthickness=0, cursor="crosshair")
-        pw.add(self.canvas, weight=1)
+        left = ttk.Frame(pw)
+        self.canvas = tk.Canvas(left, bg="#282828", highlightthickness=0, cursor="crosshair")
+        self.canvas.pack(side="top", fill="both", expand=True)
+        self.hist = HistPanel(left, self)  # shown on demand (toolbar checkbox / Ctrl+H) under the image
+        pw.add(left, weight=1)
         nb = ttk.Notebook(pw, width=390)
         pw.add(nb)
         self.panels = {}
@@ -1673,6 +2016,19 @@ class App(tk.Tk):
         self.bind("<Control-s>", lambda e: self.save())
         self.bind("<Control-z>", lambda e: self.undo())
         self.bind("<Control-y>", lambda e: self.redo())
+        self.bind("<Control-h>", lambda e: (self.hist_on.set(not self.hist_on.get()), self.toggle_hist()))
+
+    def toggle_hist(self):
+        if self.hist_on.get():
+            self.hist.pack(side="bottom", fill="x", before=self.canvas)
+            self._hist_refresh()
+        else:
+            self.hist.pack_forget()
+
+    def _hist_refresh(self):
+        ref = self._ref()
+        if self.hist_on.get() and ref is not None:
+            self.hist.update_from(ref, self.original)
 
     # ---- file ----------------------------------------------------------
     def open(self):
@@ -2092,6 +2448,7 @@ class App(tk.Tk):
             for i, (x, y) in enumerate(cp):
                 c.create_oval(x - 7, y - 7, x + 7, y + 7, outline="yellow", fill="#e33", width=2)
                 c.create_text(x + 14, y - 14, text=str(i + 1), fill="yellow", font=("Arial", 12, "bold"))
+        self._hist_refresh()
 
     # ---- mouse -----------------------------------------------------------
     def _near_split(self, x):

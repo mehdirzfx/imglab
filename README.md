@@ -26,8 +26,9 @@ imglab is a single-file Python toolkit (OpenCV + Tkinter) with a desktop GUI, a 
 |---|---|
 | **Edge detection** | Canny (auto thresholds), Sobel / Scharr / Prewitt / Roberts, Laplacian of Gaussian, Difference of Gaussians, morphological gradient, contour finder. Output as edges only, overlay on the photo, or edges with original colours. |
 | **Perspective correction** | Click 4 corners (draggable) or **auto-detect** the quadrilateral, with a "plate-like" filter and a candidate cycler. Output presets: Iran/EU/US plate, A4, ID card, square, or any custom aspect ratio. |
-| **Restoration** | De-pixelate / de-mosaic (block size detected automatically), checkerboard / halftone / moiré removal (FFT notch filter), **auto deblur** (estimates motion-blur length and angle), Wiener and Richardson–Lucy deconvolution, NL-means / bilateral / median denoise, upscale (smart multi-step, Lanczos, cubic) and optional neural **AI upscale** (EDSR, ESPCN, FSRCNN, LapSRN). |
-| **Enhance** | Unsharp mask, CLAHE, auto levels (optionally per channel to fix colour casts), gamma, brightness / contrast, grayscale, invert. |
+| **Restoration** | De-pixelate / de-mosaic (block size detected automatically), checkerboard / halftone / moiré removal (FFT notch filter), **auto deblur** (estimates motion-blur length and angle), Wiener and Richardson–Lucy deconvolution (motion, Gaussian and **disk / lens-defocus** blur), **JPEG de-blocking** (finds the 8×8 grid, even on cropped images), **haze / fog removal** (dark channel prior), **low-light brightening**, **shadow / uneven-lighting removal**, **dust & speck removal**, NL-means / bilateral / median denoise, upscale (smart multi-step, Lanczos, cubic) and optional neural **AI upscale** (EDSR, ESPCN, FSRCNN, LapSRN). |
+| **Enhance** | Unsharp mask, CLAHE, **levels** (black / white point, gamma, per channel), **histogram equalization**, **histogram matching** to a reference photo, auto levels (optionally per channel to fix colour casts), gamma, brightness / contrast, grayscale, invert. |
+| **Histogram** | Live RGB / luma / single-channel histogram under the image (toolbar *Histogram* or `Ctrl+H`): linear or log scale, the original as a dashed overlay, mean / std / usable range and black / white clipping. It follows previews, so you can watch it while dragging *Levels*, *Gamma* or *CLAHE*. |
 | **Auto Fix** | One click (toolbar *Auto Fix*, or `auto_fix` in a pipeline): diagnoses the image (mosaic, checker pattern, motion blur, tilted page, noise, low contrast, softness) and applies only the matching fixes. Clean images are left untouched. |
 | **Plate mode** | One click: detect → straighten → denoise → deblur → normalise height → local contrast → sharpen, plus an optional **OCR** button. |
 | **Geometry / threshold** | Free-angle rotate, flip, **auto deskew**, adaptive / Otsu binarisation, morphology. |
@@ -157,6 +158,7 @@ Notes:
 - **Restoration cannot invent lost detail.** De-pixelate rebuilds a smooth image from the detected blocks; it does not recover the original pixels. Deblur works best on uniform linear motion blur or a known Gaussian blur and can leave ringing around strong edges; raise *Noise* to reduce it. For noisy real photos, try *Richardson–Lucy* or lower the strength.
 - Neural **AI upscale** is the only mode that adds plausible new detail, and it is slow on large images.
 - Perspective **auto-detect** looks for a convex four-sided shape with strong edges. It can pick the wrong object in cluttered scenes — use *Next candidate* or place the corners by hand.
+- **The new restoration tools are classical algorithms, not AI.** *Dehaze* assumes the scene has some dark pixels (do not use it on a white page), *Low light* amplifies noise unless you raise its *Denoise*, *Remove dust / specks* treats thin letter strokes as specks (photos and scans only), and *Remove JPEG blocking* only smooths the block borders - it cannot bring back detail the compression threw away. *Auto fix* only adds *Low light* (for clearly dark images); the other new tools are manual.
 - **Auto deblur** is a heuristic: it detects strong linear motion blur up to about 25 px. Very long blur is missed, and a sharp image with very regular fine structure (for example thin repeated text) can occasionally be mistaken for blur. The *Min. confidence* slider controls how eager it is; use the manual *Deblur* when you know the blur. Auto deskew is typically accurate to well under a degree.
 - **Auto Fix** is conservative and rule-based, so it can miss problems or occasionally misjudge unusual images (it only considers straightening for paper-like pages with a light background). Check the result, or use `--analyze` and adjust the suggested pipeline by hand.
 - **OCR** quality depends on the engine and the plate style; the bundled engines are general-purpose, not plate-specific. Always check the output.
@@ -188,7 +190,7 @@ xvfb-run -a pytest          # Linux: run them under a virtual display
 - **CI** (`.github/workflows/ci.yml`) runs on every push and pull request: lint, the test suite on Linux (Python 3.9 / 3.11 / 3.13, with a virtual display for the GUI tests), Windows and macOS (Python 3.12, GUI tests skipped), and a command-line smoke test.
 - **Releases** (`.github/workflows/release.yml`): bump `__version__` in `imglab.py`, commit, then
   ```bash
-  git tag v1.1.1 && git push origin v1.1.1
+  git tag v1.2.0 && git push origin v1.2.0
   ```
   The workflow checks the tag against `__version__`, builds the Windows and Linux programs with PyInstaller, smoke-tests them, and attaches them with checksums to a GitHub Release. It can also be started by hand from the Actions tab to build without publishing.
 
